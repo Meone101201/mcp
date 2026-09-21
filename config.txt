@@ -1,0 +1,15 @@
+{
+    "mcpServers": {
+        "Roblox_Studio": {
+            "command": "C:\\mcp\\venv\\Scripts\\python.exe",
+            "args": [
+                "-u",
+                "C:\\mcp\\roblox_mcp_proxy.py"
+            ],
+            "env": {
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1"
+            }
+        }
+    }
+}
