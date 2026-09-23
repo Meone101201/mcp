@@ -30,6 +30,18 @@ local SETTINGS = {
 
 local autoPlayEnabled = false
 local disableAutoPlayOnMatchEnd = function() end
+local killScript = function() end
+local scriptConnections = {}
+local screenGui = nil
+local badge = nil
+local iconBtn = nil
+local lastMatchRef = nil
+
+local function safeConnect(signal, callback)
+    local conn = signal:Connect(callback)
+    table.insert(scriptConnections, conn)
+    return conn
+end
 
 -- // NOTIFICATION //
 local function notify(title, text)
@@ -1056,6 +1068,62 @@ disableAutoPlayOnMatchEnd = function()
     end
 end
 
+-- // ระบบทำลายสคริปต์ (Kill Clean) คืนทรัพยากร 100% ป้องกัน VM ค้างหรือแล็ก //
+local scriptKilled = false
+killScript = function(reason)
+    if scriptKilled then return end
+    scriptKilled = true
+
+    -- 1. ยกเลิกลูป Background Tasks ทั้งหมดทันที
+    _G.PoolGodModeInstance = (_G.PoolGodModeInstance or 0) + 1
+
+    -- 2. ปลดการล็อก Aim/Shoot คืนการควบคุมให้ผู้เล่นและเกม 100%
+    pcall(function()
+        local match = getActiveMatch()
+        if match and match.Input then
+            match.Input.AimLocked = false
+            match.Input.ChargeLocked = false
+            match.Input.Muted = false
+        end
+        if match and match.Overlay then
+            match.Overlay.GuidesEnabled = true
+        end
+        resetAimState()
+    end)
+
+    -- 3. ตัด Event Listeners ทั้งหมดที่สคริปต์สร้างไว้
+    for _, conn in ipairs(scriptConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(scriptConnections)
+
+    -- 4. ทำลายหน้าต่าง GUI (PoolLiteHUD) และไอคอนทั้งหมด
+    pcall(function()
+        if screenGui then
+            screenGui:Destroy()
+            screenGui = nil
+        end
+        local hud = playerGui:FindFirstChild("PoolLiteHUD")
+        if hud then hud:Destroy() end
+    end)
+
+    -- 5. ล้าง Global Environment และ Cache ทั้งหมด
+    pcall(function()
+        if type(getgenv) == "function" then
+            getgenv().ActivePoolMatch = nil
+            getgenv().PoolGodModeRunning = false
+            getgenv().PoolGodBot = nil
+        end
+    end)
+    activeMatchClient = nil
+    autoPlayEnabled = false
+    lastMatchRef = nil
+
+    local msg = reason or "จบการทำงานและ Kill สคริปต์เรียบร้อย 100%"
+    notify("🎱 Pool God Mode", msg)
+    warn("🛑 [Pool God Mode] KILLED: " .. tostring(msg))
+end
+
 -- // 5. REJOIN SERVER (เชื่อมต่อเข้าเซิร์ฟเวอร์ใหม่ ปลอดภัย 100%) //
 local function executeRejoin()
     notify("🎱 Rejoin Server", "กำลังเชื่อมต่อเข้าเซิร์ฟเวอร์ใหม่...")
@@ -1077,7 +1145,7 @@ local function executeRejoin()
 end
 
 pcall(function()
-    TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+    safeConnect(TeleportService.TeleportInitFailed, function(player, teleportResult, errorMessage)
         task.wait(0.5)
         pcall(function()
             TeleportService:Teleport(game.PlaceId, localPlayer)
@@ -1096,7 +1164,7 @@ if type(getgenv) == "function" then
     getgenv().PoolGodBot = _G.PoolGodBot
 end
 
-local lastMatchRef = nil
+
 local matchReadyTimestamp = 0
 
 -- ตรวจสอบว่า UI ของเกม โต๊ะ และแร็กเก็ตลูก โหลดเสร็จสมบูรณ์ 100% แล้วหรือยังก่อนเริ่มยิง
@@ -1155,11 +1223,23 @@ local currentInstance = _G.PoolGodModeInstance
 task.spawn(function()
     while _G.PoolGodModeInstance == currentInstance do
         task.wait(0.25)
-        if autoPlayEnabled then
-            local match = getActiveMatch()
+        local match = getActiveMatch()
 
-            -- ตรวจสอบการสิ้นสุดแมตช์ (GameOver / Match Finished / หลุดออกจากห้อง)
-            local isOver = false
+        -- บันทึกว่าแมตช์ได้เริ่มเล่นแล้วจริง (ป้องกันการ Kill ตอนอยู่ในล็อบบี้หรือรอห้อง)
+        if match and match.Input and match.Rules then
+            local rep = match.Replica or PoolMatchReplica.Get()
+            local pm = rep and rep.Data and rep.Data.poolMatch
+            local phase = (pm and pm.Phase) or match.Rules.Phase
+            if phase == "Playing" or phase == "Open" or phase == "Assigned" then
+                if not lastMatchRef then
+                    lastMatchRef = match.Replica or match.Rules or match.Simulation or match
+                end
+            end
+        end
+
+        -- ตรวจสอบการสิ้นสุดแมตช์ (GameOver / Match Finished / หลุดออกจากห้อง)
+        local isOver = false
+        if lastMatchRef ~= nil then
             if match then
                 local rep = match.Replica or PoolMatchReplica.Get()
                 local pm = rep and rep.Data and rep.Data.poolMatch
@@ -1169,15 +1249,19 @@ task.spawn(function()
                     isOver = true
                 end
             else
-                if lastMatchRef ~= nil then
-                    isOver = true
-                end
+                isOver = true
             end
+        end
 
-            if isOver then
-                lastMatchRef = nil
-                disableAutoPlayOnMatchEnd()
-            elseif match and match.Input and match.Rules and match.Simulation then
+        if isOver then
+            lastMatchRef = nil
+            disableAutoPlayOnMatchEnd()
+            killScript("🏁 แมตช์จบแล้ว - สคริปต์ทำลายตัวเองเรียบร้อย 100% (Clean Kill)")
+            break
+        end
+
+        if autoPlayEnabled then
+            if match and match.Input and match.Rules and match.Simulation then
                 -- ถ้าเป็นลูกเปิดโต๊ะ (Break Shot): บังคับให้ผู้เล่นยิงเปิดโต๊ะเอง ไม่ยิงอัตโนมัติ
                 if isBreakShot(match) then
                     -- คืนการควบคุมให้ผู้เล่น 100% เพื่อเล็งและยิงเปิดโต๊ะเอง
@@ -1253,13 +1337,10 @@ task.spawn(function()
     end
 end)
 
--- // UI REFERENCES (ประกาศตัวแปรก่อนใช้งานใน Listener เพื่อแก้ Unknown global) //
-local screenGui = nil
-local badge = nil
-local iconBtn = nil
+
 
 -- // KEYBIND & INPUT LISTENER //
-UserInputService.InputBegan:Connect(function(input, gpe)
+safeConnect(UserInputService.InputBegan, function(input, gpe)
     if gpe then return end
     -- เมื่อคลิกเมาส์บนโต๊ะขณะไม่ได้เปิดออโต้ ให้ปลดล็อก Aim เพื่อให้ขยับไม้ไปเล็งลูกอื่นได้ทันที
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.MouseButton2 then
@@ -1359,7 +1440,7 @@ iconDotCorner.CornerRadius = UDim.new(1, 0)
 iconDotCorner.Parent = iconDot
 
 -- เมื่อคลิกไอคอน จะเปิดหน้าต่างกลับมาตรงกลางจอเสมอ
-iconBtn.MouseButton1Click:Connect(function()
+safeConnect(iconBtn.MouseButton1Click, function()
     badge.Position = UDim2.new(0.5, 0, 0.5, 0) -- หน้าต่างอยู่กลางจอเสมอ 100%
     iconBtn.Visible = false
     badge.Visible = true
@@ -1371,81 +1452,54 @@ titleLabel.Text = "🎱 8 BALL DUELS | GOD MODE"
 titleLabel.TextColor3 = Color3.fromRGB(245, 248, 255)
 titleLabel.TextSize = 18
 titleLabel.Font = Enum.Font.GothamBold
-titleLabel.Size = UDim2.new(1, -190, 0, 26)
+titleLabel.Size = UDim2.new(1, -200, 0, 26)
 titleLabel.Position = UDim2.new(0, 18, 0, 12)
 titleLabel.BackgroundTransparency = 1
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 titleLabel.Parent = badge
 
 local subHint = Instance.new("TextLabel")
-subHint.Text = "คลิกลากย้ายได้ • กด [H] เพื่อซ่อน/แสดงหน้าต่าง"
+subHint.Text = "คลิกลากย้ายได้ • [X] ปิด/Kill • [—] ย่อลูกบอล"
 subHint.TextColor3 = Color3.fromRGB(135, 148, 172)
 subHint.TextSize = 13
 subHint.Font = Enum.Font.Gotham
-subHint.Size = UDim2.new(1, -190, 0, 18)
+subHint.Size = UDim2.new(1, -200, 0, 18)
 subHint.Position = UDim2.new(0, 18, 0, 36)
 subHint.BackgroundTransparency = 1
 subHint.TextXAlignment = Enum.TextXAlignment.Left
 subHint.Parent = badge
 
--- ปุ่มรีจอยเซิร์ฟเวอร์ด่วนบนหัวหน้าต่าง [🔄]
-local rejoinTopBtn = Instance.new("TextButton")
-rejoinTopBtn.Name = "RejoinTopBtn"
-rejoinTopBtn.Size = UDim2.new(0, 34, 0, 34)
-rejoinTopBtn.Position = UDim2.new(1, -136, 0, 12)
-rejoinTopBtn.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
-rejoinTopBtn.BorderSizePixel = 0
-rejoinTopBtn.Font = Enum.Font.GothamBold
-rejoinTopBtn.TextSize = 16
-rejoinTopBtn.TextColor3 = Color3.fromRGB(200, 215, 245)
-rejoinTopBtn.Text = "🔄"
-rejoinTopBtn.Parent = badge
+-- ปุ่มปิด/ทำลายสคริปต์ [X]
+local closeBtn = Instance.new("TextButton")
+closeBtn.Name = "CloseBtn"
+closeBtn.Size = UDim2.new(0, 32, 0, 32)
+closeBtn.Position = UDim2.new(1, -44, 0, 13)
+closeBtn.BackgroundColor3 = Color3.fromRGB(48, 22, 26)
+closeBtn.BorderSizePixel = 0
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 16
+closeBtn.TextColor3 = Color3.fromRGB(255, 90, 90)
+closeBtn.Text = "X"
+closeBtn.Parent = badge
 
-local rejoinTopCorner = Instance.new("UICorner")
-rejoinTopCorner.CornerRadius = UDim.new(0, 8)
-rejoinTopCorner.Parent = rejoinTopBtn
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 8)
+closeCorner.Parent = closeBtn
 
-local rejoinTopStroke = Instance.new("UIStroke")
-rejoinTopStroke.Color = Color3.fromRGB(60, 72, 95)
-rejoinTopStroke.Thickness = 1
-rejoinTopStroke.Parent = rejoinTopBtn
+local closeStroke = Instance.new("UIStroke")
+closeStroke.Color = Color3.fromRGB(110, 40, 50)
+closeStroke.Thickness = 1
+closeStroke.Parent = closeBtn
 
-rejoinTopBtn.MouseButton1Click:Connect(function()
-    executeRejoin()
-end)
-
--- ปุ่มดึงกลับกึ่งกลางจอ [🎯]
-local centerBtn = Instance.new("TextButton")
-centerBtn.Name = "CenterBtn"
-centerBtn.Size = UDim2.new(0, 34, 0, 34)
-centerBtn.Position = UDim2.new(1, -92, 0, 12)
-centerBtn.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
-centerBtn.BorderSizePixel = 0
-centerBtn.Font = Enum.Font.GothamBold
-centerBtn.TextSize = 16
-centerBtn.TextColor3 = Color3.fromRGB(200, 215, 245)
-centerBtn.Text = "🎯"
-centerBtn.Parent = badge
-
-local centerCorner = Instance.new("UICorner")
-centerCorner.CornerRadius = UDim.new(0, 8)
-centerCorner.Parent = centerBtn
-
-local centerStroke = Instance.new("UIStroke")
-centerStroke.Color = Color3.fromRGB(60, 72, 95)
-centerStroke.Thickness = 1
-centerStroke.Parent = centerBtn
-
-centerBtn.MouseButton1Click:Connect(function()
-    badge.Position = UDim2.new(0.5, 0, 0.5, 0)
-    notify("🎱 Pool Lite", "ย้ายหน้าต่างกลับมาตรงกลางจอเรียบร้อยแล้ว")
+safeConnect(closeBtn.MouseButton1Click, function()
+    killScript("ผู้ใช้กดปุ่ม [X] ปิดและทำลายสคริปต์ (Manual Kill)")
 end)
 
 -- ปุ่มย่อเป็นไอคอน [—]
 local minBtn = Instance.new("TextButton")
 minBtn.Name = "MinBtn"
-minBtn.Size = UDim2.new(0, 34, 0, 34)
-minBtn.Position = UDim2.new(1, -48, 0, 12)
+minBtn.Size = UDim2.new(0, 32, 0, 32)
+minBtn.Position = UDim2.new(1, -82, 0, 13)
 minBtn.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
 minBtn.BorderSizePixel = 0
 minBtn.Font = Enum.Font.GothamBold
@@ -1463,10 +1517,63 @@ minStroke.Color = Color3.fromRGB(60, 72, 95)
 minStroke.Thickness = 1
 minStroke.Parent = minBtn
 
-minBtn.MouseButton1Click:Connect(function()
+safeConnect(minBtn.MouseButton1Click, function()
     badge.Visible = false
     iconBtn.Visible = true
     notify("🎱 Pool Lite", "ย่อเป็นไอคอนแล้ว (คลิกที่ลูกบอล 🎱 เพื่อเปิดหน้าต่างกลางจอ)")
+end)
+
+-- ปุ่มดึงกลับกึ่งกลางจอ [🎯]
+local centerBtn = Instance.new("TextButton")
+centerBtn.Name = "CenterBtn"
+centerBtn.Size = UDim2.new(0, 32, 0, 32)
+centerBtn.Position = UDim2.new(1, -120, 0, 13)
+centerBtn.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
+centerBtn.BorderSizePixel = 0
+centerBtn.Font = Enum.Font.GothamBold
+centerBtn.TextSize = 16
+centerBtn.TextColor3 = Color3.fromRGB(200, 215, 245)
+centerBtn.Text = "🎯"
+centerBtn.Parent = badge
+
+local centerCorner = Instance.new("UICorner")
+centerCorner.CornerRadius = UDim.new(0, 8)
+centerCorner.Parent = centerBtn
+
+local centerStroke = Instance.new("UIStroke")
+centerStroke.Color = Color3.fromRGB(60, 72, 95)
+centerStroke.Thickness = 1
+centerStroke.Parent = centerBtn
+
+safeConnect(centerBtn.MouseButton1Click, function()
+    badge.Position = UDim2.new(0.5, 0, 0.5, 0)
+    notify("🎱 Pool Lite", "ย้ายหน้าต่างกลับมาตรงกลางจอเรียบร้อยแล้ว")
+end)
+
+-- ปุ่มรีจอยเซิร์ฟเวอร์ด่วนบนหัวหน้าต่าง [🔄]
+local rejoinTopBtn = Instance.new("TextButton")
+rejoinTopBtn.Name = "RejoinTopBtn"
+rejoinTopBtn.Size = UDim2.new(0, 32, 0, 32)
+rejoinTopBtn.Position = UDim2.new(1, -158, 0, 13)
+rejoinTopBtn.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
+rejoinTopBtn.BorderSizePixel = 0
+rejoinTopBtn.Font = Enum.Font.GothamBold
+rejoinTopBtn.TextSize = 16
+rejoinTopBtn.TextColor3 = Color3.fromRGB(200, 215, 245)
+rejoinTopBtn.Text = "🔄"
+rejoinTopBtn.Parent = badge
+
+local rejoinTopCorner = Instance.new("UICorner")
+rejoinTopCorner.CornerRadius = UDim.new(0, 8)
+rejoinTopCorner.Parent = rejoinTopBtn
+
+local rejoinTopStroke = Instance.new("UIStroke")
+rejoinTopStroke.Color = Color3.fromRGB(60, 72, 95)
+rejoinTopStroke.Thickness = 1
+rejoinTopStroke.Parent = rejoinTopBtn
+
+safeConnect(rejoinTopBtn.MouseButton1Click, function()
+    executeRejoin()
 end)
 
 -- // BODY CONTAINER //
@@ -1499,7 +1606,7 @@ snapStroke.Color = Color3.fromRGB(50, 75, 115)
 snapStroke.Thickness = 1.2
 snapStroke.Parent = snapBtn
 
-snapBtn.MouseButton1Click:Connect(function()
+safeConnect(snapBtn.MouseButton1Click, function()
     executeSnapAim(false)
 end)
 
@@ -1525,7 +1632,7 @@ shootStroke.Color = Color3.fromRGB(110, 85, 30)
 shootStroke.Thickness = 1.2
 shootStroke.Parent = shootBtn
 
-shootBtn.MouseButton1Click:Connect(function()
+safeConnect(shootBtn.MouseButton1Click, function()
     executeShoot(false)
 end)
 
@@ -1569,7 +1676,7 @@ updateHudBadge = function()
     end
 end
 
-autoBtn.MouseButton1Click:Connect(function()
+safeConnect(autoBtn.MouseButton1Click, function()
     toggleAutoPlay()
 end)
 
@@ -1656,7 +1763,7 @@ for i, opt in ipairs(bounceOptions) do
     bStroke.Thickness = 1
     bStroke.Parent = bBtn
 
-    bBtn.MouseButton1Click:Connect(function()
+    safeConnect(bBtn.MouseButton1Click, function()
         SETTINGS.MaxBounces = opt.val
         updateBounceUI()
         notify("🎱 เส้นชิ่ง", "ตั้งค่าแสดงเส้นชิ่ง: " .. opt.text)
@@ -1689,7 +1796,7 @@ rejoinStroke.Color = Color3.fromRGB(45, 65, 100)
 rejoinStroke.Thickness = 1.2
 rejoinStroke.Parent = rejoinBtn
 
-rejoinBtn.MouseButton1Click:Connect(function()
+safeConnect(rejoinBtn.MouseButton1Click, function()
     executeRejoin()
 end)
 
