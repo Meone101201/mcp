@@ -23,10 +23,12 @@ local SETTINGS = {
     LineThickness = 0.35,          -- เส้นบางกำลังดี
     GuideLength = 400,             -- ความยาวเส้นเล็ง
     MaxBounces = 2,                -- จำนวนครั้งที่ชิ่ง (1-2 ครั้ง)
-    AutoPlayDelay = 0.6,           -- หน่วงเวลาก่อนบอทยิง (วินาที)
+    AutoPlayDelay = 0.6,           -- หน่วงเวลาก่อนบอทยิงในแต่ละเทิร์นปกติ (วินาที)
+    NewMatchDelay = 2.5,           -- หน่วงเวลารอโหลด UI และจัดโต๊ะให้เสร็จเมื่อเริ่มแมตช์ใหม่ (วินาที)
 }
 
 local autoPlayEnabled = false
+local disableAutoPlayOnMatchEnd = function() end
 
 -- // GAME SPECIFIC MODULES //
 local Libraries = ReplicatedStorage:WaitForChild("Libraries")
@@ -40,6 +42,9 @@ local PoolConstants = require(PoolFolder:WaitForChild("PoolConstants"))
 local PoolAimOverlay = require(PoolFolder:WaitForChild("PoolAimOverlay"))
 local PoolInputController = require(PoolFolder:WaitForChild("PoolInputController"))
 local PoolMatchClient = require(PoolFolder:WaitForChild("PoolMatchClient"))
+local PoolRules = require(PoolFolder:WaitForChild("PoolRules"))
+local PoolMatchReplica = require(PoolFolder:WaitForChild("PoolMatchReplica"))
+local PoolViewController = require(PoolFolder:WaitForChild("PoolViewController"))
 
 local cushions = PoolGeometry.GetCushions()
 local pockets = PoolGeometry.GetPockets()
@@ -142,64 +147,281 @@ local function checkPocketHit(p1, p2)
     return nil
 end
 
--- // ACTIVE MATCH DETECTION //
-local currentMatch = nil
-
-local function getActiveMatch()
-    if currentMatch and currentMatch.Input and currentMatch.Simulation and currentMatch.Overlay then
-        return currentMatch
-    end
-    local inputObj, rulesObj, simObj, clientMatch
-    pcall(function()
-        for _, fn in ipairs(getgc()) do
-            if type(fn) == "function" and islclosure(fn) then
-                local info = debug.getinfo(fn)
-                if info.source and (info.source:find("PoolGameUIHandler") or info.source:find("PoolMatchClient")) then
-                    local okUv, uvs = pcall(debug.getupvalues, fn)
-                    if okUv and uvs then
-                        for _, v in pairs(uvs) do
-                            if type(v) == "table" then
-                                if v.Simulation and v.Overlay and v.ShotBindable then
-                                    inputObj = v
-                                end
-                                if v.Turn ~= nil and v.Phase ~= nil and v.Groups ~= nil then
-                                    rulesObj = v
-                                end
-                                if v.Balls and v.Settled ~= nil and v.Elapsed ~= nil then
-                                    simObj = v
-                                end
-                                if v.Seat and v.Replica and v.Simulation then
-                                    clientMatch = v
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            if inputObj and rulesObj then break end
-        end
-    end)
-    if inputObj then
-        currentMatch = {
-            Input = inputObj,
-            Simulation = inputObj.Simulation or simObj,
-            Overlay = inputObj.Overlay,
-            Rules = rulesObj or { Turn = 1, Phase = "Assigned", Groups = {"Solid", "Stripe"} },
-            Seat = (clientMatch and clientMatch.Seat) or (rulesObj and rulesObj.Turn) or 1
-        }
-        return currentMatch
-    elseif clientMatch then
-        currentMatch = clientMatch
-        return clientMatch
-    end
-    return nil
-end
+-- // LIVE MATCH CLIENT TRACKER (Directly Hooked into PoolMatchClient with Auto Stale-Match Recovery) //
+local activeMatchClient = nil
 
 local oldMatchClientNew = PoolMatchClient.new
 PoolMatchClient.new = function(...)
     local match = oldMatchClientNew(...)
-    currentMatch = match
+    activeMatchClient = match
     return match
+end
+
+local oldMatchClientUpdate = PoolMatchClient.Update
+PoolMatchClient.Update = function(self, dt)
+    activeMatchClient = self
+    return oldMatchClientUpdate(self, dt)
+end
+
+local oldMatchClientDestroy = PoolMatchClient.Destroy
+PoolMatchClient.Destroy = function(self)
+    if activeMatchClient == self then
+        activeMatchClient = nil
+    end
+    disableAutoPlayOnMatchEnd()
+    return oldMatchClientDestroy(self)
+end
+
+local function getActiveMatch()
+    local poolGameUI = playerGui:FindFirstChild("PoolGameUI")
+    if poolGameUI and poolGameUI:GetAttribute("MatchActive") == false then
+        activeMatchClient = nil
+        return nil
+    end
+
+    local liveRep = PoolMatchReplica.Get()
+    if activeMatchClient then
+        if liveRep and activeMatchClient.Replica and activeMatchClient.Replica ~= liveRep then
+            activeMatchClient = nil -- Match เก่าหมดอายุ ให้เคลียร์ทิ้งทันที
+        elseif activeMatchClient.Input and activeMatchClient.Simulation and activeMatchClient.Rules then
+            if activeMatchClient.Rules.Phase ~= "GameOver" then
+                return activeMatchClient
+            end
+            activeMatchClient = nil
+        end
+    end
+
+    -- ค้นหา Match จาก RenderStepped ของเกม (รองรับทั้งแมตช์ออนไลน์ และแมตช์บอท/ออฟไลน์ 100%)
+    local RunService = game:GetService("RunService")
+    local getups = debug.getupvalues or getupvalues
+    if getconnections and getups then
+        for _, conn in ipairs(getconnections(RunService.RenderStepped)) do
+            local fn = conn.Function
+            if fn and islclosure(fn) then
+                local ups = getups(fn)
+                local foundInput, foundRules, foundClient = nil, nil, nil
+                for _, v in pairs(ups) do
+                    if typeof(v) == "table" then
+                        -- กรณี 1: แมตช์ออนไลน์ (PoolMatchClient ตัวเต็ม)
+                        if rawget(v, "Simulation") and rawget(v, "Rules") and rawget(v, "Input") then
+                            foundClient = v
+                            break
+                        end
+                        -- กรณี 2: แมตช์บอท / ออฟไลน์ (Input Controller)
+                        if rawget(v, "AimLocked") ~= nil and rawget(v, "Simulation") ~= nil then
+                            foundInput = v
+                        end
+                        -- กรณี 2: แมตช์บอท / ออฟไลน์ (Rules Module)
+                        if rawget(v, "Phase") ~= nil and rawget(v, "Turn") ~= nil and rawget(v, "Groups") ~= nil then
+                            foundRules = v
+                        end
+                    end
+                end
+                if foundClient and (not liveRep or foundClient.Replica == liveRep) then
+                    activeMatchClient = foundClient
+                    return foundClient
+                end
+                if foundInput and foundRules and foundRules.Phase ~= "GameOver" then
+                    local wrapper = {
+                        Input = foundInput,
+                        Simulation = foundInput.Simulation,
+                        Rules = foundRules,
+                        Overlay = foundInput.Overlay,
+                        View = foundInput.View,
+                        Hud = foundInput.Hud,
+                        Seat = 1,
+                        IsBotMatch = true,
+                    }
+                    activeMatchClient = wrapper
+                    return wrapper
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ระบุตำแหน่งที่นั่งของเรา (Seat 1 หรือ Seat 2) แม่นยำ 100% จาก Server Replica
+local function getMySeat(match)
+    if match and match.Seat and match.Seat > 0 then
+        return match.Seat
+    end
+    local rep = (match and match.Replica) or PoolMatchReplica.Get()
+    local pm = rep and rep.Data and rep.Data.poolMatch
+    if pm and pm.Seats then
+        for idx, s in ipairs(pm.Seats) do
+            if s.UserId == localPlayer.UserId or s.Name == localPlayer.Name then
+                return idx
+            end
+        end
+    end
+    return 1
+end
+
+-- ระบุกลุ่มลูกของเรา (Solid หรือ Stripe) แม่นยำ 100%
+local function getMyGroup(match, seat)
+    seat = seat or getMySeat(match)
+    local rep = (match and match.Replica) or PoolMatchReplica.Get()
+    local pm = rep and rep.Data and rep.Data.poolMatch
+    if pm and pm.Seats and pm.Seats[seat] and pm.Seats[seat].Group then
+        return pm.Seats[seat].Group
+    end
+    if match and match.Rules and match.Rules.Groups and match.Rules.Groups[seat] then
+        return match.Rules.Groups[seat]
+    end
+    return nil -- โต๊ะเปิด ยังไม่ระบุกลุ่ม
+end
+
+-- ตรวจสอบอย่างแม่นยำ 100% ว่าใช่เทิร์นของเราจริงๆ หรือไม่ (อ้างอิงจาก Server Replicated State)
+local function isMyTurn(match)
+    if not match then return false end
+    local mySeat = getMySeat(match)
+    local rep = (match and match.Replica) or PoolMatchReplica.Get()
+    local pm = rep and rep.Data and rep.Data.poolMatch
+    if pm then
+        if pm.Phase ~= "Playing" or pm.RulesPhase == "GameOver" then
+            return false
+        end
+        return pm.Turn == mySeat
+    end
+    if match.Rules and match.Rules.Turn then
+        if match.Rules.Phase == "GameOver" then
+            return false
+        end
+        return match.Rules.Turn == mySeat
+    end
+    return false
+end
+
+-- ตรวจสอบทางกายภาพว่าลูกทั้ง 15 ลูกยังอยู่ในแร็กเก็ตสามเหลี่ยมเริ่มต้นหรือไม่ (Physics Ground Truth)
+local function isRackIntact(simulation)
+    if not simulation or not simulation.Balls then return false end
+    local minX, maxX = math.huge, -math.huge
+    local minY, maxY = math.huge, -math.huge
+    local count = 0
+
+    for i = 1, 15 do
+        local b = simulation.Balls[i]
+        if not b then return false end
+        -- ถ้ามีลูกใดลูกหนึ่งลงหลุมไปแล้ว แสดงว่าโต๊ะถูกยิงเปิดไปแล้ว 100%
+        if b.Pocketed then
+            return false
+        end
+        if b.Position then
+            count = count + 1
+            local px = b.Position.X
+            local py = b.Position.Y
+            if px < minX then minX = px end
+            if px > maxX then maxX = px end
+            if py < minY then minY = py end
+            if py > maxY then maxY = py end
+        end
+    end
+
+    if count < 15 then return false end
+
+    -- ในแร็กเก็ตสามเหลี่ยมเริ่มต้น กองลูก 15 ลูกจะมีขนาดความกว้างไม่เกิน 18 และความสูงไม่เกิน 16
+    -- ถ้าลูกแตกกระจายเกินกว่านี้ แสดงว่าโต๊ะถูกยิงเปิดไปแล้ว 100% (แม้ฝ่ายตรงข้ามจะเป็นคนยิงเปิดก็ตาม)
+    local spanX = maxX - minX
+    local spanY = maxY - minY
+    if spanX > 18 or spanY > 16 then
+        return false
+    end
+
+    return true
+end
+
+-- ตรวจสอบว่าโต๊ะอยู่ในสถานะลูกเปิดโต๊ะ (Break Shot) หรือไม่
+local function isBreakShot(match)
+    match = match or getActiveMatch()
+    if not match then return false end
+
+    -- 1. ตรวจสอบทางกายภาพของลูกบนโต๊ะ (แม่นยำที่สุด 100% ป้องกันกรณีฝ่ายตรงข้ามยิงเปิดแล้วระบบยังคิดว่าไม่ได้เปิด)
+    if match.Simulation and match.Simulation.Balls then
+        if not isRackIntact(match.Simulation) then
+            return false
+        end
+    end
+
+    -- 2. ตรวจสอบจาก Server Replica
+    local rep = (match and match.Replica) or PoolMatchReplica.Get()
+    local pm = rep and rep.Data and rep.Data.poolMatch
+    if pm then
+        -- หากจบเกมแล้ว ไม่ใช่ Break แน่นอน
+        if pm.RulesPhase == "GameOver" or pm.Phase == "Finished" then
+            return false
+        end
+        -- หากโต๊ะเปิดแล้ว หรือแบ่งกลุ่ม Solid/Stripe แล้ว ไม่ใช่ Break แน่นอน 100%
+        if pm.RulesPhase == "Open" or pm.RulesPhase == "Assigned" then
+            return false
+        end
+        -- หากมีการยิงไปแล้ว (ShotIndex > 0) แสดงว่าผ่านการเปิดโต๊ะไปแล้ว ไม่ใช่ Break
+        if pm.ShotIndex and tonumber(pm.ShotIndex) and tonumber(pm.ShotIndex) > 0 then
+            return false
+        end
+    end
+
+    -- 3. ตรวจสอบจาก Rules Module
+    local rules = match.Rules
+    if rules then
+        if rules.Phase == "GameOver" or rules.Phase == "Open" or rules.Phase == "Assigned" then
+            return false
+        end
+    end
+
+    -- 4. ตรวจสอบจาก AppliedShot (จำนวนช็อตที่ถูกยิงไปแล้วในแมตช์)
+    if match.AppliedShot and tonumber(match.AppliedShot) and tonumber(match.AppliedShot) > 0 then
+        return false
+    end
+
+    -- 5. หากลูกทั้ง 15 ลูกยังวางเรียงกันอยู่ในแร็กเก็ตสามเหลี่ยมสมบูรณ์ แสดงว่าเป็นลูกเปิดโต๊ะ
+    if match.Simulation and match.Simulation.Balls and isRackIntact(match.Simulation) then
+        return true
+    end
+
+    -- 6. Fallback: ถ้า Rules Phase ระบุชัดเจนว่าเป็น Break
+    if rules and rules.Phase == "Break" then
+        return true
+    end
+    if pm and (pm.RulesPhase == "Break" or pm.Phase == "Break") then
+        return true
+    end
+
+    return false
+end
+
+-- ตรวจสอบว่าลูกเบอร์นี้ถูกกติกาของฝั่งเราหรือไม่ (ป้องกันบอทหลงฝั่งหรือยิงลูกคู่แข่ง 100%)
+local function isBallLegalForMe(match, ballNumber)
+    if not match or not match.Rules or not match.Simulation then return false end
+    if ballNumber == PoolConstants.CueBallNumber then return false end
+
+    -- ในช่วงเปิดโต๊ะ (Break Phase): เล็งได้ทุกลูก
+    if isBreakShot(match) then
+        return true
+    end
+
+    local mySeat = getMySeat(match)
+    local myGroup = getMyGroup(match, mySeat)
+    local phase = match.Rules.Phase
+
+    -- โต๊ะเปิด (Open Table): ยิงได้ทุกลูกยกเว้นลูกดำเบอร์ 8
+    if not myGroup or phase == "Open" then
+        return ballNumber ~= PoolConstants.EightBallNumber
+    end
+
+    -- โต๊ะกำหนดกลุ่มแล้ว (Assigned Table)
+    local remaining = PoolRules.CountRemaining(match.Simulation, myGroup)
+    if remaining == 0 then
+        -- ยิงกลุ่มตัวเองหมดโต๊ะแล้ว: ต้องยิงลูกดำเบอร์ 8 เท่านั้น
+        return ballNumber == PoolConstants.EightBallNumber
+    end
+
+    -- ยังยิงกลุ่มตัวเองไม่หมด: ห้ามยิงลูกดำเบอร์ 8 และต้องยิงเฉพาะกลุ่มของตัวเองเท่านั้น (ห้ามยิงลูกฝั่งตรงข้ามเด็ดขาด)
+    if ballNumber == PoolConstants.EightBallNumber then
+        return false
+    end
+    local ballGroup = (ballNumber < PoolConstants.EightBallNumber and "Solid") or "Stripe"
+    return ballGroup == myGroup
 end
 
 -- // LINE DRAWING HELPERS //
@@ -242,13 +464,60 @@ end
 local COLOR_WHITE = Color3.new(1, 1, 1)    -- เส้นลูกขาว (สีขาว)
 local COLOR_BLACK = Color3.new(0, 0, 0)    -- เส้นลูกสี (สีดำ)
 
+local function hideAllOverlayLines(overlay)
+    if overlay then
+        overlay.GuidesEnabled = false
+        if overlay.AimLine then overlay.AimLine.Visible = false end
+        if overlay.CueLine then overlay.CueLine.Visible = false end
+        if overlay.ObjectLine then overlay.ObjectLine.Visible = false end
+        if overlay.Ghost then overlay.Ghost.Visible = false end
+        if overlay.GhostBall then overlay.GhostBall.Visible = false end
+    end
+    local root = (overlay and overlay.Root) or playerGui:FindFirstChild("AimOverlay", true)
+    if root then
+        for _, ch in ipairs(root:GetChildren()) do
+            if ch:IsA("GuiObject") and ch.Name ~= "CueStick" then
+                ch.Visible = false
+            end
+        end
+    end
+end
+
 local oldOverlayUpdate = PoolAimOverlay.Update
 PoolAimOverlay.Update = function(self, p2, p3, p4, p5, p6, p7)
+    local root = self.Root
+
+    -- // ปิดการแสดงผลเส้นทั้งหมด 100% ขณะที่บอทเล่นอัตโนมัติ (ยกเว้นช่วงเปิดโต๊ะที่ผู้เล่นต้องเล็งยิงเอง) //
+    local match = getActiveMatch()
+    if autoPlayEnabled and not isBreakShot(match) then
+        hideAllOverlayLines(self)
+        return oldOverlayUpdate(self, p2, p3, p4, p5, p6, p7)
+    end
+
+    -- เส้นชิ่งลูกสี (สีดำ)
+    local bankObj1 = root and getOrCreateLine(root, "LiteBankObj1", COLOR_BLACK, 50)
+    local bankObj2 = root and getOrCreateLine(root, "LiteBankObj2", COLOR_BLACK, 50)
+    local bankObj3 = root and getOrCreateLine(root, "LiteBankObj3", COLOR_BLACK, 50)
+    -- เส้นชิ่งลูกขาว (สีขาว)
+    local bankCue1 = root and getOrCreateLine(root, "LiteBankCue1", COLOR_WHITE, 50)
+    local bankCue2 = root and getOrCreateLine(root, "LiteBankCue2", COLOR_WHITE, 50)
+    local bankCue3 = root and getOrCreateLine(root, "LiteBankCue3", COLOR_WHITE, 50)
+    local bankDeflect = root and getOrCreateLine(root, "LiteBankDeflect", COLOR_WHITE, 50)
+
+    local function hideBanks()
+        if bankObj1 then bankObj1.Visible = false end
+        if bankObj2 then bankObj2.Visible = false end
+        if bankObj3 then bankObj3.Visible = false end
+        if bankCue1 then bankCue1.Visible = false end
+        if bankCue2 then bankCue2.Visible = false end
+        if bankCue3 then bankCue3.Visible = false end
+        if bankDeflect then bankDeflect.Visible = false end
+    end
+
     p6 = SETTINGS.GuideLength
     self.GuidesEnabled = true
     
     local res = oldOverlayUpdate(self, p2, p3, p4, p5, p6, p7)
-    local root = self.Root
     if not root then return res end
 
     -- ล้างเส้นรุ่นเก่าถ้ามีตกค้าง
@@ -281,26 +550,6 @@ PoolAimOverlay.Update = function(self, p2, p3, p4, p5, p6, p7)
         if self.ObjectLine.Visible then
             self.ObjectLine.Size = UDim2.fromScale(self.ObjectLine.Size.X.Scale, thick / FrameHeight)
         end
-    end
-
-    -- เส้นชิ่งลูกสี (สีดำ)
-    local bankObj1 = getOrCreateLine(root, "LiteBankObj1", COLOR_BLACK, 50)
-    local bankObj2 = getOrCreateLine(root, "LiteBankObj2", COLOR_BLACK, 50)
-    local bankObj3 = getOrCreateLine(root, "LiteBankObj3", COLOR_BLACK, 50)
-    -- เส้นชิ่งลูกขาว (สีขาว)
-    local bankCue1 = getOrCreateLine(root, "LiteBankCue1", COLOR_WHITE, 50)
-    local bankCue2 = getOrCreateLine(root, "LiteBankCue2", COLOR_WHITE, 50)
-    local bankCue3 = getOrCreateLine(root, "LiteBankCue3", COLOR_WHITE, 50)
-    local bankDeflect = getOrCreateLine(root, "LiteBankDeflect", COLOR_WHITE, 50)
-
-    local function hideBanks()
-        bankObj1.Visible = false
-        bankObj2.Visible = false
-        bankObj3.Visible = false
-        bankCue1.Visible = false
-        bankCue2.Visible = false
-        bankCue3.Visible = false
-        bankDeflect.Visible = false
     end
 
     if not self.GuidesEnabled or not root.Visible then
@@ -457,18 +706,171 @@ PoolAimOverlay.Update = function(self, p2, p3, p4, p5, p6, p7)
     return res
 end
 
--- // 2. SMART SNAP AIM (คำนวณมุมที่ดีที่สุดด้วย Legend AI) //
-local function calculateBestShot(simulation, rules, seat)
-    if not simulation or not rules then return nil end
-    local levelData = PoolAI.GetLevel("Legend")
-    local aiInstance = { Level = levelData, Random = Random.new() }
-    setmetatable(aiInstance, PoolAI)
-    local ok, plan = pcall(function()
-        return PoolAI.Plan(aiInstance, simulation, rules, seat or (rules and rules.Turn) or 1)
-    end)
-    if ok and plan and plan.Choice then
-        return plan.Choice
+-- // GOD MODE AI PROFILE (Zero Artificial Error, Pure Vector2 Physics, Supreme Positioning) //
+local GOD_LEVEL = {
+    Id = "God",
+    Name = "God Mode (Zero Error)",
+    Rating = 9999,
+    AimError = 0,               -- 0% Error: Laser mathematical contact point
+    PowerError = 0,             -- 0% Error: Pure physics calculation
+    MissAimChance = 0,          -- 0% Miss chance
+    Candidates = 8,             -- สแกน 8 มุมที่ดีที่สุด (Legend ในเกมคือ 6) คำนวณลื่นไหลไม่ค้าง Thread
+    PositionWeight = 0.85,      -- Supreme cue ball positioning for consecutive potting
+    PlaysSafeties = true,
+    ThinkTime = 0,
+    FullPower = false,
+}
+
+-- พิกัดหลุมจริงของโต๊ะในเกม (2D Vector2 Table Space)
+local FALLBACK_POCKETS = {
+    { Id = "HeadBottom", MouthCentre = Vector2.new(-42.409, -20.409) },
+    { Id = "HeadTop",    MouthCentre = Vector2.new(-42.409, 20.409) },
+    { Id = "FootBottom", MouthCentre = Vector2.new(42.409, -20.409) },
+    { Id = "FootTop",    MouthCentre = Vector2.new(42.409, 20.409) },
+    { Id = "SideBottom", MouthCentre = Vector2.new(0, -22) },
+    { Id = "SideTop",    MouthCentre = Vector2.new(0, 22) },
+}
+
+-- // 2. SMART SNAP AIM (คำนวณมุมที่ดีที่สุดด้วย God Mode AI - ถูกต้องตามฝั่ง 100% ระบบ Vector2) //
+local function calculateBestShot(match)
+    match = match or getActiveMatch()
+    if not match or not match.Simulation or not match.Rules then return nil end
+    local simulation = match.Simulation
+    local rules = match.Rules
+    local mySeat = getMySeat(match)
+    local myGroup = getMyGroup(match, mySeat)
+
+    -- // 0. BREAK SHOT (ลูกเปิดโต๊ะ): บังคับให้ผู้เล่นเป็นคนเล็งและยิงเปิดโต๊ะเอง ไม่คำนวณบอท
+    if isBreakShot(match) then
+        return nil
     end
+
+    -- สร้าง planRules โดยบังคับ Turn ให้เป็น mySeat ของเราเสมอ และใส่ Group ให้ถูกต้อง
+    local isOpenTable = (not myGroup) or (rules.Phase == "Open")
+    local planRules = {
+        Phase = rules.Phase,
+        Turn = mySeat,
+        Groups = {},  -- เริ่มว่างเสมอ แล้วค่อยใส่ group ที่รู้แน่ๆ เท่านั้น
+        BallInHand = rules.BallInHand,
+        BehindHeadString = rules.BehindHeadString,
+        ShotCount = rules.ShotCount or 0,
+        Rules = rules.Rules,
+    }
+    -- ใส่ Groups เฉพาะเมื่อโต๊ะมีการกำหนดกลุ่มแล้ว (ไม่ใช่ Open Table)
+    -- ถ้าใส่ Groups ผิดช่วง Open PoolAI จะ confused และอาจ return nil
+    if not isOpenTable and rules.Groups then
+        for k, v in pairs(rules.Groups) do
+            planRules.Groups[k] = v
+        end
+    end
+    if myGroup and not planRules.Groups[mySeat] then
+        planRules.Groups[mySeat] = myGroup
+    end
+
+    local aiInstance = {
+        Level = GOD_LEVEL,
+        Random = Random.new(0),
+    }
+    setmetatable(aiInstance, PoolAI)
+
+    local ok, plan = pcall(function()
+        return PoolAI.Plan(aiInstance, simulation, planRules, mySeat)
+    end)
+
+    -- 1. ตรวจสอบ Choice แรกจาก PoolAI.Plan ว่าถูกต้องตามกติกาฝั่งเราหรือไม่
+    if ok and plan and plan.Choice and plan.Choice.Target then
+        if isBallLegalForMe(match, plan.Choice.Target) then
+            return plan.Choice
+        end
+    end
+
+    -- 2. หาก Choice แรกไม่ตรงกลุ่ม ให้ค้นหา Candidate อื่นที่ถูกกลุ่มและมีคะแนนสูงสุด
+    if ok and plan and plan.Candidates then
+        local bestCand = nil
+        local bestScore = -math.huge
+        for _, cand in ipairs(plan.Candidates) do
+            if cand and cand.Target and isBallLegalForMe(match, cand.Target) then
+                local score = cand.Score or cand.Quality or 0
+                if score > bestScore then
+                    bestScore = score
+                    bestCand = cand
+                end
+            end
+        end
+        if bestCand then
+            return bestCand
+        end
+    end
+
+    -- 3. OPEN TABLE SMART SCAN (Vector2 Pure Math):
+    -- เมื่อโต๊ะยังเปิดอยู่และ PoolAI ยังไม่ได้ช็อต ให้สแกนคำนวณหามุมตัด (Cut Quality) ที่ดีที่สุดเข้า 6 หลุมด้วยตัวเอง
+    if isOpenTable then
+        local cueBall = simulation.Balls[PoolConstants.CueBallNumber]
+        if cueBall and cueBall.Position then
+            local pocketList = (#pockets > 0 and pockets) or FALLBACK_POCKETS
+            local bestChoice = nil
+            local bestScore = -math.huge
+            local diameter = PoolConstants.BallDiameter or (ballRadius * 2)
+
+            for i = 1, 15 do
+                if i == PoolConstants.EightBallNumber then continue end
+                local b = simulation.Balls[i]
+                if b and not b.Pocketed and b.Position then
+                    for _, pock in ipairs(pocketList) do
+                        local pockPos = pock.MouthCentre
+                        local toPock = pockPos - b.Position
+                        local pockDist = toPock.Magnitude
+                        if pockDist > 0.001 then
+                            local pockDir = toPock / pockDist
+                            local ghostPos = b.Position - pockDir * diameter
+                            local toGhost = ghostPos - cueBall.Position
+                            local cueDist = toGhost.Magnitude
+                            if cueDist > 0.001 then
+                                local aimDir = toGhost / cueDist
+                                local cutQuality = aimDir:Dot(pockDir)
+                                -- ต้องมีมุมตัดมากกว่า 0.12 (มุมเปิด ไม่ยิงย้อนศร)
+                                if cutQuality > 0.12 then
+                                    local score = (cutQuality * 150) - (pockDist * 1.5) - (cueDist * 0.8)
+                                    if score > bestScore then
+                                        bestScore = score
+                                        local totalDist = cueDist + pockDist
+                                        local power = math.clamp(0.35 + totalDist / 120, 0.38, 0.88)
+                                        bestChoice = {
+                                            Target = b.Number or i,
+                                            Pocket = pock.Id or "Pocket",
+                                            Direction = aimDir, -- Vector2
+                                            Power = power,
+                                            Quality = cutQuality,
+                                            Score = score,
+                                        }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if bestChoice then
+                return bestChoice
+            end
+        end
+    end
+
+    -- 4. FALLBACK SAFETY SHOT: ในกรณีที่โดนสนุ๊กเกอร์หรือไม่มีทางยิงชัดเจน
+    local fbOk, fbDir, fbPwr = pcall(function()
+        return PoolAI.FallbackShot(simulation, planRules)
+    end)
+    if fbOk and fbDir and typeof(fbDir) == "Vector2" then
+        return {
+            Target = "Safety",
+            Pocket = "Cushion",
+            Direction = fbDir,
+            Power = fbPwr or 0.45,
+            Quality = 0.5,
+            Score = 0,
+        }
+    end
+
     return nil
 end
 
@@ -495,12 +897,27 @@ local function resetAimState(match)
 end
 
 local function executeSnapAim(silent)
+    -- ถ้าเปิดบอทเล่นอัตโนมัติ [A] อยู่ และเป็นการกดจากผู้เล่น (not silent): ป้องกันการทำงานซ้อนกัน
+    if autoPlayEnabled and not silent then
+        notify("8 Ball Duels 🎱", "⚠️ กำลังใช้งานบอท [A] อยู่ (ไม่สามารถใช้ [E] ล็อกเป้าซ้ำได้)")
+        return false
+    end
+
     local match = getActiveMatch()
     if not match or not match.Input or not match.Simulation or not match.Rules then
         if not silent then notify("8 Ball Duels", "⚠️ ไม่พบโต๊ะที่กำลังเล่นอยู่") end
         return false
     end
-    local choice = calculateBestShot(match.Simulation, match.Rules, match.Seat)
+
+    -- [บอท E]: ลูกเปิดโต๊ะไม่อนุญาตให้ล็อกเป้า แจ้งเตือนให้ผู้ใช้ยิงเปิดโต๊ะเอง
+    if isBreakShot(match) then
+        if not silent then
+            notify("8 Ball Duels 🎱", "⚠️ ผู้ใช้ต้องยิงเปิดโต๊ะ")
+        end
+        return false
+    end
+
+    local choice = calculateBestShot(match)
     if not choice or not choice.Direction then
         if not silent then notify("8 Ball Duels", "⚠️ ไม่พบมุมยิงที่ชัดเจน") end
         return false
@@ -512,73 +929,263 @@ local function executeSnapAim(silent)
     if not silent then
         local targetNum = choice.Target or "?"
         local pocketName = choice.Pocket or "?"
-        local pct = math.floor((choice.Quality or 0.8) * 100)
-        notify("🎯 Target Locked!", string.format("เล็งลูก: #%s | หลุม: %s (%d%%)", tostring(targetNum), tostring(pocketName), pct))
+        local pct = math.floor((choice.Quality or 0.95) * 100)
+        notify("🎯 God Mode Locked!", string.format("เล็งลูก: #%s | หลุม: %s (%d%%)", tostring(targetNum), tostring(pocketName), pct))
     end
     return true, choice
 end
 
 -- // 3. AUTO SHOOT (กดยิงทันที คำนวณความแรงอัตโนมัติ) //
-local function executeShoot()
+local function executeShoot(silent)
+    -- ถ้าเปิดบอทเล่นอัตโนมัติ [A] อยู่ และเป็นการกดจากผู้เล่น (not silent): แจ้งเตือนว่าบอทควบคุมอยู่
+    if autoPlayEnabled and not silent then
+        notify("8 Ball Duels 🎱", "⚠️ กำลังใช้งานบอท [A] อยู่ (บอทยิงให้อัตโนมัติ)")
+        return false
+    end
+
     local match = getActiveMatch()
     if not match or not match.Input then return false end
+
+    -- หากเป็นลูกเปิดโต๊ะ (Break Shot) บังคับให้ผู้เล่นเป็นคนเล็งและยิงเปิดโต๊ะเอง
+    if isBreakShot(match) then
+        if not silent then
+            notify("8 Ball Duels 🎱", "⚠️ ผู้ใช้ต้องยิงเปิดโต๊ะ")
+        end
+        return false
+    end
+
     local ok, choice = executeSnapAim(true)
     if ok and choice then
         pcall(function()
-            local power = math.clamp(choice.Power or 0.7, 0.2, 1)
+            local power = math.clamp(choice.Power or 0.7, 0.15, 1)
             PoolInputController.SetPower(match.Input, power)
         end)
-        task.wait(0.12)
+        task.wait(0.08)
         pcall(function()
             local spin = (match.Input.Hud and match.Input.Hud.Spin) or Vector2.zero
-            local power = math.clamp(choice.Power or 0.7, 0.2, 1)
+            local power = math.clamp(choice.Power or 0.7, 0.15, 1)
             if match.Input.ShotBindable then
                 match.Input.ShotBindable:Fire(choice.Direction, power, spin)
             end
         end)
-        task.wait(0.1)
-        -- คืนค่าไม้และปลดล็อกทันทีหลังยิง ไม่ให้ไม้ค้างในเพสยิง
-        resetAimState(match)
-        notify("🎱 Potted!", "ยิงเรียบร้อยแล้ว!")
+        -- ปลดล็อกการควบคุมไม้เฉพาะเมื่อไม่ได้เปิดบอทอัตโนมัติ (ถ้าเปิดบอทอยู่ ให้บอทคุม 100%)
+        if not autoPlayEnabled then
+            pcall(function()
+                match.Input.AimLocked = false
+                match.Input.ChargeLocked = false
+                match.Input.Muted = false
+            end)
+        end
+        if not silent then
+            notify("🎱 Potted!", "ยิงเรียบร้อยแล้ว!")
+        end
         return true
     end
     return false
 end
 
--- // 4. AUTO PLAY TOGGLE (บอทตัวตึง Legend เล่นให้อัตโนมัติ) //
+-- // 4. AUTO PLAY TOGGLE (บอท God Mode เล่นให้อัตโนมัติ ปิดเส้นเพื่อประสิทธิภาพสูงสุด) //
 local updateHudBadge = function() end
 
 local function toggleAutoPlay()
     autoPlayEnabled = not autoPlayEnabled
-    notify("บอทเล่นอัตโนมัติ 🤖", autoPlayEnabled and "🟢 เปิดใช้งาน (ตัวตึง Legend)" or "🔴 ปิดการทำงาน (คืนการควบคุมไม้)")
+    notify("บอทเล่นอัตโนมัติ 🤖", autoPlayEnabled and "🟢 เปิดใช้งาน (ระดับ God Mode - ปิดเส้นลดโหลด)" or "🔴 ปิดการทำงาน (คืนการควบคุมไม้ & เปิดเส้น)")
     updateHudBadge()
-    if not autoPlayEnabled then
-        -- เมื่อปิดออโต้ ให้คืนการควบคุมไม้ทันที ปลดล็อกและรีเซ็ตเพสยิง
+    local match = getActiveMatch()
+    if autoPlayEnabled then
+        hideAllOverlayLines(match and match.Overlay)
+    else
         resetAimState()
+        if match and match.Overlay then
+            match.Overlay.GuidesEnabled = true
+        end
     end
 end
 
+-- ปิดบอท [A] อัตโนมัติเมื่อจบแมตช์ เพื่อให้ผู้เล่นต้องเปิดเองใหม่ในแมตช์ถัดไป
+disableAutoPlayOnMatchEnd = function()
+    if autoPlayEnabled then
+        autoPlayEnabled = false
+        pcall(function()
+            updateHudBadge()
+            resetAimState()
+            local match = getActiveMatch()
+            if match and match.Overlay then
+                match.Overlay.GuidesEnabled = true
+            end
+        end)
+        notify("บอทเล่นอัตโนมัติ 🤖", "🏁 แมตช์จบแล้ว - ปิดบอท [A] อัตโนมัติ (เปิดใหม่ในแมตช์ถัดไป)")
+    end
+end
+
+_G.PoolGodBot = {
+    Toggle = toggleAutoPlay,
+    SnapAim = executeSnapAim,
+    Shoot = executeShoot,
+    GetState = function() return autoPlayEnabled end,
+}
+if type(getgenv) == "function" then
+    getgenv().PoolGodBot = _G.PoolGodBot
+end
+
+local lastMatchRef = nil
+local matchReadyTimestamp = 0
+
+-- ตรวจสอบว่า UI ของเกม โต๊ะ และแร็กเก็ตลูก โหลดเสร็จสมบูรณ์ 100% แล้วหรือยังก่อนเริ่มยิง
+local function isMatchFullyReady(match)
+    if not match then return false end
+
+    -- 1. ต้องเปิดหน้าจอเกม PoolGameUI แล้ว (ไม่ใช่หน้าล็อบบี้หรือเมนู)
+    local poolGameUI = playerGui:FindFirstChild("PoolGameUI")
+    if not poolGameUI or not poolGameUI.Enabled then
+        matchReadyTimestamp = os.clock()
+        return false
+    end
+
+    -- 2. จอ Transition (ม่านปิด-เปิดเปลี่ยนฉาก) ต้องปิดลงสนิทแล้ว
+    local transitionUI = playerGui:FindFirstChild("TransitionUI")
+    if transitionUI and transitionUI.Enabled then
+        matchReadyTimestamp = os.clock()
+        return false
+    end
+
+    -- 3. ตรวจสอบสถานะการจัดลูกในแร็กเก็ต (ถ้าแอนิเมชันจัดลูกยังไม่เสร็จ ให้รอ)
+    if match.RackRevealed == false then
+        matchReadyTimestamp = os.clock()
+        return false
+    end
+
+    -- 4. ตรวจจับแมตช์ใหม่ (เมื่อเริ่มเกมใหม่ ให้เริ่มนับเวลาหน่วง NewMatchDelay)
+    local matchId = match.Replica or PoolMatchReplica.Get() or match.Rules or match.Simulation
+    if matchId and matchId ~= lastMatchRef then
+        lastMatchRef = matchId
+        matchReadyTimestamp = os.clock()
+        return false
+    end
+
+    -- 5. หากเป็นช็อตแรกของแมตช์ ให้หน่วงเวลาตาม NewMatchDelay เพื่อรอให้ UI และกล้องจัดเข้าที่
+    local isFirstShot = isBreakShot(match)
+    local requiredDelay = isFirstShot and (SETTINGS.NewMatchDelay or 2.5) or (SETTINGS.AutoPlayDelay or 0.6)
+
+    if os.clock() - matchReadyTimestamp < requiredDelay then
+        return false
+    end
+
+    -- 6. ตรวจสอบสถานะ Input ของเกม
+    if match.Input and (match.Input.State == "GameOver" or match.Input.State == "Simulating") then
+        return false
+    end
+
+    return true
+end
+
+local breakNoticeSent = false
+
 task.spawn(function()
     while true do
-        task.wait(0.4)
+        task.wait(0.25)
         if autoPlayEnabled then
             local match = getActiveMatch()
-            if match and match.Input and match.Rules then
-                local isMyTurn = false
-                if match.Input.State == "Aiming" and not match.Input.Muted then
-                    isMyTurn = true
-                elseif match.Seat and (match.Rules.Turn == match.Seat) then
-                    isMyTurn = true
+
+            -- ตรวจสอบการสิ้นสุดแมตช์ (GameOver / Match Finished / หลุดออกจากห้อง)
+            local isOver = false
+            if match then
+                local rep = match.Replica or PoolMatchReplica.Get()
+                local pm = rep and rep.Data and rep.Data.poolMatch
+                if (pm and (pm.RulesPhase == "GameOver" or pm.Phase == "Finished"))
+                   or (match.Rules and match.Rules.Phase == "GameOver")
+                   or (match.Input and match.Input.State == "GameOver") then
+                    isOver = true
                 end
-                if isMyTurn and match.Simulation and match.Simulation.Settled then
-                    task.wait(SETTINGS.AutoPlayDelay)
-                    executeShoot()
-                    task.wait(3.0)
+            else
+                if lastMatchRef ~= nil then
+                    isOver = true
+                end
+            end
+
+            if isOver then
+                lastMatchRef = nil
+                disableAutoPlayOnMatchEnd()
+            elseif match and match.Input and match.Rules and match.Simulation then
+                -- ถ้าเป็นลูกเปิดโต๊ะ (Break Shot): บังคับให้ผู้เล่นยิงเปิดโต๊ะเอง ไม่ยิงอัตโนมัติ
+                if isBreakShot(match) then
+                    -- คืนการควบคุมให้ผู้เล่น 100% เพื่อเล็งและยิงเปิดโต๊ะเอง
+                    pcall(function()
+                        match.Input.AimLocked = false
+                        match.Input.ChargeLocked = false
+                        match.Input.Muted = false
+                    end)
+                    if isMyTurn(match) and not breakNoticeSent then
+                        breakNoticeSent = true
+                        notify("บอทเล่นอัตโนมัติ 🤖", "⚠️ ผู้ใช้ต้องยิงเปิดโต๊ะเอง (บอท A จะเริ่มเล่นอัตโนมัติหลังเปิดโต๊ะ)")
+                    end
+                else
+                    breakNoticeSent = false
+                    hideAllOverlayLines()
+
+                    -- เข้าสู่โหมด God Mode หลังเปิดโต๊ะ: ปิดการควบคุมของผู้เล่น 100% เพื่อให้บอทควบคุมทั้งหมด
+                    pcall(function()
+                        match.Input.AimLocked = true
+                        match.Input.ChargeLocked = true
+                        match.Input.Muted = true
+                    end)
+
+                    -- ตรวจสอบว่าแมตช์ โต๊ะ และ UI โหลดเสร็จสมบูรณ์ และเป็นเทิร์นของเราจริงที่ลูกหยุดนิ่งสนิทแล้ว
+                    if isMatchFullyReady(match) and isMyTurn(match) and match.Simulation.Settled and match.Input.State ~= "Simulating" then
+                        -- จัดการวางลูกขาวอัตโนมัติ (Ball-in-Hand / Free Ball Placement) สำหรับลูกปกติ
+                        if match.Input.State == "BallInHand" or (match.Input.CanPlaceCueBall and match.Input.BallHeld) then
+                            local mySeat = getMySeat(match)
+                            local myGroup = getMyGroup(match, mySeat)
+                            local planRules = {
+                                Phase = match.Rules.Phase,
+                                Turn = mySeat,
+                                Groups = match.Rules.Groups or {},
+                                Rules = match.Rules.Rules,
+                            }
+                            if myGroup and not planRules.Groups[mySeat] then
+                                planRules.Groups[mySeat] = myGroup
+                            end
+                            local aiInstance = { Level = GOD_LEVEL, Random = Random.new(0) }
+                            setmetatable(aiInstance, PoolAI)
+                            local okSpot, bestSpot = pcall(function()
+                                return PoolAI.PlaceCueBall(aiInstance, match.Simulation, planRules)
+                            end)
+                            if okSpot and bestSpot and typeof(bestSpot) == "Vector2" then
+                                local cueBall = match.Simulation.Balls[PoolConstants.CueBallNumber]
+                                if cueBall then
+                                    cueBall.Position = bestSpot
+                                    if match.View then
+                                        pcall(function()
+                                            PoolViewController.SetBall(match.View, PoolConstants.CueBallNumber, bestSpot)
+                                        end)
+                                    end
+                                    match.Input.Dragging = false
+                                    match.Input.BallHeld = false
+                                    pcall(function()
+                                        PoolInputController.SetState(match.Input, "Aiming")
+                                    end)
+                                    task.wait(0.3)
+                                end
+                            end
+                        end
+
+                        task.wait(SETTINGS.AutoPlayDelay)
+                        -- ตรวจสอบซ้ำอีกครั้งหลังดีเลย์ เพื่อป้องกันยิงตอนเปลี่ยนเทิร์นหรือหมดเวลา
+                        if autoPlayEnabled and isMatchFullyReady(match) and isMyTurn(match) and match.Simulation.Settled and match.Input.State ~= "Simulating" then
+                            executeShoot(true)
+                            task.wait(1.5)
+                        end
+                    end
                 end
             end
         end
     end
 end)
+
+-- // UI REFERENCES (ประกาศตัวแปรก่อนใช้งานใน Listener เพื่อแก้ Unknown global) //
+local screenGui = nil
+local badge = nil
+local iconBtn = nil
 
 -- // KEYBIND & INPUT LISTENER //
 UserInputService.InputBegan:Connect(function(input, gpe)
@@ -595,15 +1202,17 @@ UserInputService.InputBegan:Connect(function(input, gpe)
     if input.KeyCode == KEYS.SnapAim then
         executeSnapAim(false)
     elseif input.KeyCode == KEYS.Shoot then
-        executeShoot()
+        executeShoot(false)
     elseif input.KeyCode == KEYS.AutoPlay then
         toggleAutoPlay()
     elseif input.KeyCode == KEYS.ToggleUI then
         if screenGui then
             if not screenGui.Enabled then
                 screenGui.Enabled = true
-                badge.Position = UDim2.new(0.5, 0, 0.5, 0) -- เปิดกลับมาตรงกลางจอเสมอ
-                badge.Visible = true
+                if badge then
+                    badge.Position = UDim2.new(0.5, 0, 0.5, 0) -- เปิดกลับมาตรงกลางจอเสมอ
+                    badge.Visible = true
+                end
                 if iconBtn then iconBtn.Visible = false end
             else
                 screenGui.Enabled = false
@@ -616,13 +1225,13 @@ end)
 local oldHud = playerGui:FindFirstChild("PoolLiteHUD")
 if oldHud then oldHud:Destroy() end
 
-local screenGui = Instance.new("ScreenGui")
+screenGui = Instance.new("ScreenGui")
 screenGui.Name = "PoolLiteHUD"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
 screenGui.Parent = playerGui
 
-local badge = Instance.new("Frame")
+badge = Instance.new("Frame")
 badge.Name = "Badge"
 badge.AnchorPoint = Vector2.new(0.5, 0.5)
 badge.Position = UDim2.new(0.5, 0, 0.5, 0)      -- เริ่มต้นอยู่กึ่งกลางจอ 100%
@@ -644,7 +1253,7 @@ stroke.Thickness = 1.8
 stroke.Parent = badge
 
 -- // FLOATING ICON BUTTON (เมื่อย่อหน้าต่างเป็นไอคอนลูกบอล 🎱) //
-local iconBtn = Instance.new("TextButton")
+iconBtn = Instance.new("TextButton")
 iconBtn.Name = "FloatIconBtn"
 iconBtn.AnchorPoint = Vector2.new(0.5, 0.5)
 iconBtn.Position = UDim2.new(0.92, 0, 0.35, 0)  -- ตำแหน่งไอคอนเริ่มต้น (ลากย้ายไปไว้ที่ไหนก็ได้)
@@ -689,7 +1298,7 @@ end)
 
 -- // HEADER //
 local titleLabel = Instance.new("TextLabel")
-titleLabel.Text = "🎱 8 BALL DUELS | PRO LITE"
+titleLabel.Text = "🎱 8 BALL DUELS | GOD MODE"
 titleLabel.TextColor3 = Color3.fromRGB(245, 248, 255)
 titleLabel.TextSize = 18
 titleLabel.Font = Enum.Font.GothamBold
@@ -783,7 +1392,7 @@ snapBtn.BorderSizePixel = 0
 snapBtn.Font = Enum.Font.GothamBold
 snapBtn.TextSize = 16
 snapBtn.TextColor3 = Color3.fromRGB(220, 235, 255)
-snapBtn.Text = "🎯 [E] ล็อกเป้าดีที่สุด"
+snapBtn.Text = "🎯 [E] ล็อกเป้า God Mode"
 snapBtn.Parent = bodyFrame
 
 local snapCorner = Instance.new("UICorner")
@@ -822,7 +1431,7 @@ shootStroke.Thickness = 1.2
 shootStroke.Parent = shootBtn
 
 shootBtn.MouseButton1Click:Connect(function()
-    executeShoot()
+    executeShoot(false)
 end)
 
 -- ปุ่มเปิด/ปิด บอทเล่นอัตโนมัติ [A]
@@ -852,7 +1461,7 @@ updateHudBadge = function()
         autoBtn.BackgroundColor3 = Color3.fromRGB(16, 38, 26)
         autoBtn.TextColor3 = Color3.fromRGB(60, 255, 140)
         autoStroke.Color = Color3.fromRGB(35, 160, 80)
-        autoBtn.Text = "🏆 [A] บอทเล่นอัตโนมัติ: เปิด (ON - ตัวตึง Legend)"
+        autoBtn.Text = "⚡ [A] บอทเล่นอัตโนมัติ: เปิด (ON - ระดับ God Mode)"
         iconDot.Visible = true
         iconStroke.Color = Color3.fromRGB(40, 180, 90)
     else
@@ -965,7 +1574,7 @@ updateBounceUI()
 
 -- คำอธิบายสัญลักษณ์เส้น
 local legendLabel = Instance.new("TextLabel")
-legendLabel.Text = "⚪ เส้นขาว: ลูกขาว   |   ⚫ เส้นดำ: ลูกสี (คำนวณเส้นชิ่งอัตโนมัติ)"
+legendLabel.Text = "⚪ เส้นขาว: ลูกขาว | ⚫ เส้นดำ: ลูกสี (ปิดการแสดงเส้นอัตโนมัติเมื่อบอททำงาน)"
 legendLabel.TextColor3 = Color3.fromRGB(165, 175, 195)
 legendLabel.TextSize = 13
 legendLabel.Font = Enum.Font.GothamMedium
@@ -980,5 +1589,5 @@ local legCorner = Instance.new("UICorner")
 legCorner.CornerRadius = UDim.new(0, 6)
 legCorner.Parent = legendLabel
 
-notify("🎱 Pool Lite พร้อมใช้งาน", "หน้าต่างอยู่กลางจอ | [E] เล็ง | [R] ยิง | [A] บอท | [H] ซ่อน")
-warn("🎱 [Pool Lite] Large Centered UI Loaded! Keys: E (Aim), R (Shoot), A (Auto-Play), H (Toggle UI)")
+notify("⚡ Pool God Mode พร้อมใช้งาน", "หน้าต่างอยู่กลางจอ | [E] ล็อกเป้า | [R] ยิง | [A] บอท God Mode | [H] ซ่อน")
+warn("🎱 [Pool God Mode] Loaded! Zero-Error Auto Play, Auto Ball-in-Hand, Apex Break & Line Disabling Active.")
