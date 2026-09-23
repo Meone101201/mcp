@@ -7,6 +7,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local StarterGui = game:GetService("StarterGui")
+local TeleportService = game:GetService("TeleportService")
 
 local localPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 local playerGui = localPlayer:WaitForChild("PlayerGui")
@@ -30,29 +31,6 @@ local SETTINGS = {
 local autoPlayEnabled = false
 local disableAutoPlayOnMatchEnd = function() end
 
--- // GAME SPECIFIC MODULES //
-local Libraries = ReplicatedStorage:WaitForChild("Libraries")
-local GameSpecific = Libraries:WaitForChild("GameSpecific")
-local PoolFolder = GameSpecific:WaitForChild("Pool")
-
-local PoolAI = require(PoolFolder:WaitForChild("PoolAI"))
-local PoolPhysics = require(PoolFolder:WaitForChild("PoolPhysics"))
-local PoolGeometry = require(PoolFolder:WaitForChild("PoolGeometry"))
-local PoolConstants = require(PoolFolder:WaitForChild("PoolConstants"))
-local PoolAimOverlay = require(PoolFolder:WaitForChild("PoolAimOverlay"))
-local PoolInputController = require(PoolFolder:WaitForChild("PoolInputController"))
-local PoolMatchClient = require(PoolFolder:WaitForChild("PoolMatchClient"))
-local PoolRules = require(PoolFolder:WaitForChild("PoolRules"))
-local PoolMatchReplica = require(PoolFolder:WaitForChild("PoolMatchReplica"))
-local PoolViewController = require(PoolFolder:WaitForChild("PoolViewController"))
-
-local cushions = PoolGeometry.GetCushions()
-local pockets = PoolGeometry.GetPockets()
-local ballRadius = PoolConstants.BallRadius
-local ballDiameter = PoolConstants.BallDiameter
-local FrameWidth = PoolConstants.FrameWidth
-local FrameHeight = PoolConstants.FrameHeight
-
 -- // NOTIFICATION //
 local function notify(title, text)
     pcall(function()
@@ -63,6 +41,62 @@ local function notify(title, text)
         })
     end)
 end
+
+-- // GAME SPECIFIC MODULES //
+-- ป้องกันการค้าง Yield ตลอดกาลหากรันผิด PlaceId หรือเกมยังโหลดไม่เสร็จ
+local Libraries = ReplicatedStorage:WaitForChild("Libraries", 10)
+if not Libraries then
+    notify("8 Ball Duels ❌", "ไม่พบโฟลเดอร์เกม (PlaceId ปัจจุบัน: " .. tostring(game.PlaceId) .. " ไม่ใช่ 8 Ball Duels)")
+    warn("❌ [Pool God Mode] Cannot load: ReplicatedStorage.Libraries not found. PlaceId: " .. tostring(game.PlaceId))
+    return
+end
+
+local GameSpecific = Libraries:WaitForChild("GameSpecific", 5)
+local PoolFolder = GameSpecific and GameSpecific:WaitForChild("Pool", 5)
+if not PoolFolder then
+    notify("8 Ball Duels ❌", "ไม่พบโฟลเดอร์ Pool ใน PlaceId: " .. tostring(game.PlaceId))
+    warn("❌ [Pool God Mode] Cannot load: PoolFolder not found. PlaceId: " .. tostring(game.PlaceId))
+    return
+end
+
+local function safeRequire(parent, name, timeout)
+    if not parent then return nil end
+    local child = parent:WaitForChild(name, timeout or 15)
+    if not child then
+        warn("⚠️ [Pool God Mode] Missing module: " .. tostring(name))
+        return nil
+    end
+    local ok, mod = pcall(require, child)
+    if not ok then
+        warn("⚠️ [Pool God Mode] Error requiring " .. tostring(name) .. ": " .. tostring(mod))
+        return nil
+    end
+    return mod
+end
+
+local PoolAI = safeRequire(PoolFolder, "PoolAI", 15)
+local PoolPhysics = safeRequire(PoolFolder, "PoolPhysics", 15)
+local PoolGeometry = safeRequire(PoolFolder, "PoolGeometry", 15)
+local PoolConstants = safeRequire(PoolFolder, "PoolConstants", 15)
+local PoolAimOverlay = safeRequire(PoolFolder, "PoolAimOverlay", 15)
+local PoolInputController = safeRequire(PoolFolder, "PoolInputController", 15)
+local PoolMatchClient = safeRequire(PoolFolder, "PoolMatchClient", 15)
+local PoolRules = safeRequire(PoolFolder, "PoolRules", 15)
+local PoolMatchReplica = safeRequire(PoolFolder, "PoolMatchReplica", 15)
+local PoolViewController = safeRequire(PoolFolder, "PoolViewController", 15)
+
+if not PoolGeometry or not PoolConstants or not PoolMatchClient then
+    notify("8 Ball Duels ❌", "โหลดโมดูลเกมไม่ครบ กรุณาลองรันใหม่อีกครั้ง")
+    warn("❌ [Pool God Mode] Critical modules failed to load.")
+    return
+end
+
+local cushions = (PoolGeometry.GetCushions and PoolGeometry.GetCushions()) or {}
+local pockets = (PoolGeometry.GetPockets and PoolGeometry.GetPockets()) or {}
+local ballRadius = PoolConstants.BallRadius or 1.125
+local ballDiameter = PoolConstants.BallDiameter or 2.25
+local FrameWidth = PoolConstants.FrameWidth or 50
+local FrameHeight = PoolConstants.FrameHeight or 100
 
 -- // CLEAN PREVIOUS HEAVY UI //
 pcall(function()
@@ -147,31 +181,23 @@ local function checkPocketHit(p1, p2)
     return nil
 end
 
--- // LIVE MATCH CLIENT TRACKER (Directly Hooked into PoolMatchClient with Auto Stale-Match Recovery) //
+-- // LIVE MATCH CLIENT TRACKER //
 local activeMatchClient = nil
 
-local oldMatchClientNew = PoolMatchClient.new
-PoolMatchClient.new = function(...)
-    local match = oldMatchClientNew(...)
-    activeMatchClient = match
-    return match
-end
-
-local oldMatchClientUpdate = PoolMatchClient.Update
-PoolMatchClient.Update = function(self, dt)
-    activeMatchClient = self
-    return oldMatchClientUpdate(self, dt)
-end
-
-local oldMatchClientDestroy = PoolMatchClient.Destroy
-PoolMatchClient.Destroy = function(self)
-    if activeMatchClient == self then
-        activeMatchClient = nil
+if not PoolMatchClient._godHooked then
+    PoolMatchClient._godHooked = true
+    local oldMatchClientNew = PoolMatchClient.new
+    PoolMatchClient.new = function(...)
+        local match = oldMatchClientNew(...)
+        activeMatchClient = match
+        if type(getgenv) == "function" then
+            getgenv().ActivePoolMatch = match
+        end
+        return match
     end
-    disableAutoPlayOnMatchEnd()
-    return oldMatchClientDestroy(self)
 end
 
+local lastScanTimestamp = 0
 local function getActiveMatch()
     local poolGameUI = playerGui:FindFirstChild("PoolGameUI")
     if poolGameUI and poolGameUI:GetAttribute("MatchActive") == false then
@@ -191,54 +217,64 @@ local function getActiveMatch()
         end
     end
 
-    -- ค้นหา Match จาก RenderStepped ของเกม (รองรับทั้งแมตช์ออนไลน์ และแมตช์บอท/ออฟไลน์ 100%)
-    local RunService = game:GetService("RunService")
-    local getups = debug.getupvalues or getupvalues
-    if getconnections and getups then
-        for _, conn in ipairs(getconnections(RunService.RenderStepped)) do
-            local fn = conn.Function
-            if fn and islclosure(fn) then
-                local ups = getups(fn)
-                local foundInput, foundRules, foundClient = nil, nil, nil
-                for _, v in pairs(ups) do
-                    if typeof(v) == "table" then
-                        -- กรณี 1: แมตช์ออนไลน์ (PoolMatchClient ตัวเต็ม)
-                        if rawget(v, "Simulation") and rawget(v, "Rules") and rawget(v, "Input") then
-                            foundClient = v
-                            break
-                        end
-                        -- กรณี 2: แมตช์บอท / ออฟไลน์ (Input Controller)
-                        if rawget(v, "AimLocked") ~= nil and rawget(v, "Simulation") ~= nil then
-                            foundInput = v
-                        end
-                        -- กรณี 2: แมตช์บอท / ออฟไลน์ (Rules Module)
-                        if rawget(v, "Phase") ~= nil and rawget(v, "Turn") ~= nil and rawget(v, "Groups") ~= nil then
-                            foundRules = v
+    -- Throttled scan: ค้นหาไม่เกิน 1 ครั้งต่อ 3 วินาที เพื่อป้องกันทำงานซ้ำซ้อน
+    local now = os.clock()
+    if now - lastScanTimestamp < 3 then
+        return activeMatchClient
+    end
+    lastScanTimestamp = now
+
+    -- ค้นหา Match กรณีรันสคริปต์กลางคันขณะที่แมตช์เริ่มไปแล้ว (ปลอดภัย 100% ไม่ยุ่งกับ RenderStepped connections)
+    pcall(function()
+        if type(getgc) == "function" then
+            local inputObj, rulesObj, simObj, clientMatch
+            for _, fn in ipairs(getgc()) do
+                if type(fn) == "function" and islclosure(fn) then
+                    local info = debug.getinfo(fn)
+                    if info.source and (info.source:find("PoolGameUIHandler") or info.source:find("PoolMatchClient")) then
+                        local okUv, uvs = pcall(debug.getupvalues, fn)
+                        if okUv and uvs then
+                            for _, v in pairs(uvs) do
+                                if typeof(v) == "table" then
+                                    if rawget(v, "Simulation") and rawget(v, "Rules") and rawget(v, "Input") then
+                                        clientMatch = v
+                                        break
+                                    end
+                                    if rawget(v, "AimLocked") ~= nil and rawget(v, "Simulation") ~= nil then
+                                        inputObj = v
+                                    end
+                                    if rawget(v, "Phase") ~= nil and rawget(v, "Turn") ~= nil and rawget(v, "Groups") ~= nil then
+                                        rulesObj = v
+                                    end
+                                    if rawget(v, "Balls") and rawget(v, "Settled") ~= nil then
+                                        simObj = v
+                                    end
+                                end
+                            end
                         end
                     end
                 end
-                if foundClient and (not liveRep or foundClient.Replica == liveRep) then
-                    activeMatchClient = foundClient
-                    return foundClient
-                end
-                if foundInput and foundRules and foundRules.Phase ~= "GameOver" then
-                    local wrapper = {
-                        Input = foundInput,
-                        Simulation = foundInput.Simulation,
-                        Rules = foundRules,
-                        Overlay = foundInput.Overlay,
-                        View = foundInput.View,
-                        Hud = foundInput.Hud,
-                        Seat = 1,
-                        IsBotMatch = true,
-                    }
-                    activeMatchClient = wrapper
-                    return wrapper
-                end
+                if clientMatch or (inputObj and rulesObj) then break end
+            end
+
+            if clientMatch and (not liveRep or clientMatch.Replica == liveRep) then
+                activeMatchClient = clientMatch
+            elseif inputObj and rulesObj and rulesObj.Phase ~= "GameOver" then
+                activeMatchClient = {
+                    Input = inputObj,
+                    Simulation = inputObj.Simulation or simObj,
+                    Rules = rulesObj,
+                    Overlay = inputObj.Overlay,
+                    View = inputObj.View,
+                    Hud = inputObj.Hud,
+                    Seat = 1,
+                    IsBotMatch = true,
+                }
             end
         end
-    end
-    return nil
+    end)
+
+    return activeMatchClient
 end
 
 -- ระบุตำแหน่งที่นั่งของเรา (Seat 1 หรือ Seat 2) แม่นยำ 100% จาก Server Replica
@@ -488,10 +524,12 @@ PoolAimOverlay.Update = function(self, p2, p3, p4, p5, p6, p7)
     local root = self.Root
 
     -- // ปิดการแสดงผลเส้นทั้งหมด 100% ขณะที่บอทเล่นอัตโนมัติ (ยกเว้นช่วงเปิดโต๊ะที่ผู้เล่นต้องเล็งยิงเอง) //
-    local match = getActiveMatch()
-    if autoPlayEnabled and not isBreakShot(match) then
-        hideAllOverlayLines(self)
-        return oldOverlayUpdate(self, p2, p3, p4, p5, p6, p7)
+    if autoPlayEnabled then
+        local match = activeMatchClient
+        if match and not isBreakShot(match) then
+            hideAllOverlayLines(self)
+            return oldOverlayUpdate(self, p2, p3, p4, p5, p6, p7)
+        end
     end
 
     -- เส้นชิ่งลูกสี (สีดำ)
@@ -1018,10 +1056,40 @@ disableAutoPlayOnMatchEnd = function()
     end
 end
 
+-- // 5. REJOIN SERVER (เชื่อมต่อเข้าเซิร์ฟเวอร์ใหม่ ปลอดภัย 100%) //
+local function executeRejoin()
+    notify("🎱 Rejoin Server", "กำลังเชื่อมต่อเข้าเซิร์ฟเวอร์ใหม่...")
+    task.spawn(function()
+        local ok = pcall(function()
+            if #Players:GetPlayers() > 1 and (game.JobId and game.JobId ~= "") then
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, localPlayer)
+            else
+                TeleportService:Teleport(game.PlaceId, localPlayer)
+            end
+        end)
+        if not ok then
+            task.wait(0.5)
+            pcall(function()
+                TeleportService:Teleport(game.PlaceId, localPlayer)
+            end)
+        end
+    end)
+end
+
+pcall(function()
+    TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+        task.wait(0.5)
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, localPlayer)
+        end)
+    end)
+end)
+
 _G.PoolGodBot = {
     Toggle = toggleAutoPlay,
     SnapAim = executeSnapAim,
     Shoot = executeShoot,
+    Rejoin = executeRejoin,
     GetState = function() return autoPlayEnabled end,
 }
 if type(getgenv) == "function" then
@@ -1081,8 +1149,11 @@ end
 
 local breakNoticeSent = false
 
+_G.PoolGodModeInstance = (_G.PoolGodModeInstance or 0) + 1
+local currentInstance = _G.PoolGodModeInstance
+
 task.spawn(function()
-    while true do
+    while _G.PoolGodModeInstance == currentInstance do
         task.wait(0.25)
         if autoPlayEnabled then
             local match = getActiveMatch()
@@ -1192,11 +1263,8 @@ UserInputService.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     -- เมื่อคลิกเมาส์บนโต๊ะขณะไม่ได้เปิดออโต้ ให้ปลดล็อก Aim เพื่อให้ขยับไม้ไปเล็งลูกอื่นได้ทันที
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.MouseButton2 then
-        if not autoPlayEnabled then
-            local match = getActiveMatch()
-            if match and match.Input and match.Input.AimLocked then
-                match.Input.AimLocked = false
-            end
+        if not autoPlayEnabled and activeMatchClient and activeMatchClient.Input and activeMatchClient.Input.AimLocked then
+            activeMatchClient.Input.AimLocked = false
         end
     end
     if input.KeyCode == KEYS.SnapAim then
@@ -1229,13 +1297,14 @@ screenGui = Instance.new("ScreenGui")
 screenGui.Name = "PoolLiteHUD"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
+screenGui.DisplayOrder = 2147483647
 screenGui.Parent = playerGui
 
 badge = Instance.new("Frame")
 badge.Name = "Badge"
 badge.AnchorPoint = Vector2.new(0.5, 0.5)
 badge.Position = UDim2.new(0.5, 0, 0.5, 0)      -- เริ่มต้นอยู่กึ่งกลางจอ 100%
-badge.Size = UDim2.new(0, 500, 0, 280)          -- ขยายขนาดใหญ่พิเศษ ชัดเจน สบายตา
+badge.Size = UDim2.new(0, 500, 0, 330)          -- ขยายขนาดใหญ่พิเศษ ชัดเจน สบายตา
 badge.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
 badge.BorderSizePixel = 0
 badge.Active = true
@@ -1302,7 +1371,7 @@ titleLabel.Text = "🎱 8 BALL DUELS | GOD MODE"
 titleLabel.TextColor3 = Color3.fromRGB(245, 248, 255)
 titleLabel.TextSize = 18
 titleLabel.Font = Enum.Font.GothamBold
-titleLabel.Size = UDim2.new(1, -150, 0, 26)
+titleLabel.Size = UDim2.new(1, -190, 0, 26)
 titleLabel.Position = UDim2.new(0, 18, 0, 12)
 titleLabel.BackgroundTransparency = 1
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -1313,11 +1382,37 @@ subHint.Text = "คลิกลากย้ายได้ • กด [H] เพ
 subHint.TextColor3 = Color3.fromRGB(135, 148, 172)
 subHint.TextSize = 13
 subHint.Font = Enum.Font.Gotham
-subHint.Size = UDim2.new(1, -150, 0, 18)
+subHint.Size = UDim2.new(1, -190, 0, 18)
 subHint.Position = UDim2.new(0, 18, 0, 36)
 subHint.BackgroundTransparency = 1
 subHint.TextXAlignment = Enum.TextXAlignment.Left
 subHint.Parent = badge
+
+-- ปุ่มรีจอยเซิร์ฟเวอร์ด่วนบนหัวหน้าต่าง [🔄]
+local rejoinTopBtn = Instance.new("TextButton")
+rejoinTopBtn.Name = "RejoinTopBtn"
+rejoinTopBtn.Size = UDim2.new(0, 34, 0, 34)
+rejoinTopBtn.Position = UDim2.new(1, -136, 0, 12)
+rejoinTopBtn.BackgroundColor3 = Color3.fromRGB(28, 33, 46)
+rejoinTopBtn.BorderSizePixel = 0
+rejoinTopBtn.Font = Enum.Font.GothamBold
+rejoinTopBtn.TextSize = 16
+rejoinTopBtn.TextColor3 = Color3.fromRGB(200, 215, 245)
+rejoinTopBtn.Text = "🔄"
+rejoinTopBtn.Parent = badge
+
+local rejoinTopCorner = Instance.new("UICorner")
+rejoinTopCorner.CornerRadius = UDim.new(0, 8)
+rejoinTopCorner.Parent = rejoinTopBtn
+
+local rejoinTopStroke = Instance.new("UIStroke")
+rejoinTopStroke.Color = Color3.fromRGB(60, 72, 95)
+rejoinTopStroke.Thickness = 1
+rejoinTopStroke.Parent = rejoinTopBtn
+
+rejoinTopBtn.MouseButton1Click:Connect(function()
+    executeRejoin()
+end)
 
 -- ปุ่มดึงกลับกึ่งกลางจอ [🎯]
 local centerBtn = Instance.new("TextButton")
@@ -1572,6 +1667,32 @@ end
 
 updateBounceUI()
 
+-- ปุ่มกดรีจอยเซิร์ฟเวอร์ [🔄 Rejoin Server]
+local rejoinBtn = Instance.new("TextButton")
+rejoinBtn.Name = "RejoinBtn"
+rejoinBtn.Size = UDim2.new(1, -36, 0, 42)
+rejoinBtn.Position = UDim2.new(0, 18, 0, 170)
+rejoinBtn.BackgroundColor3 = Color3.fromRGB(20, 27, 40)
+rejoinBtn.BorderSizePixel = 0
+rejoinBtn.Font = Enum.Font.GothamBold
+rejoinBtn.TextSize = 15
+rejoinBtn.TextColor3 = Color3.fromRGB(150, 200, 255)
+rejoinBtn.Text = "🔄 รีจอยเซิร์ฟเวอร์ (Rejoin Server)"
+rejoinBtn.Parent = bodyFrame
+
+local rejoinCorner = Instance.new("UICorner")
+rejoinCorner.CornerRadius = UDim.new(0, 8)
+rejoinCorner.Parent = rejoinBtn
+
+local rejoinStroke = Instance.new("UIStroke")
+rejoinStroke.Color = Color3.fromRGB(45, 65, 100)
+rejoinStroke.Thickness = 1.2
+rejoinStroke.Parent = rejoinBtn
+
+rejoinBtn.MouseButton1Click:Connect(function()
+    executeRejoin()
+end)
+
 -- คำอธิบายสัญลักษณ์เส้น
 local legendLabel = Instance.new("TextLabel")
 legendLabel.Text = "⚪ เส้นขาว: ลูกขาว | ⚫ เส้นดำ: ลูกสี (ปิดการแสดงเส้นอัตโนมัติเมื่อบอททำงาน)"
@@ -1579,7 +1700,7 @@ legendLabel.TextColor3 = Color3.fromRGB(165, 175, 195)
 legendLabel.TextSize = 13
 legendLabel.Font = Enum.Font.GothamMedium
 legendLabel.Size = UDim2.new(1, -36, 0, 30)
-legendLabel.Position = UDim2.new(0, 18, 0, 170)
+legendLabel.Position = UDim2.new(0, 18, 0, 220)
 legendLabel.BackgroundColor3 = Color3.fromRGB(20, 23, 32)
 legendLabel.BorderSizePixel = 0
 legendLabel.TextXAlignment = Enum.TextXAlignment.Center
