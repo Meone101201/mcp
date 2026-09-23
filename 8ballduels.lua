@@ -25,6 +25,9 @@ local SETTINGS = {
     GuideLength = 400,             -- ความยาวเส้นเล็ง
     MaxBounces = 2,                -- จำนวนครั้งที่ชิ่ง (1-2 ครั้ง)
     AutoPlayDelay = 0.6,           -- หน่วงเวลาก่อนบอทยิงในแต่ละเทิร์นปกติ (วินาที)
+    AutoLoopInterval = 0.5,      -- ตรวจสถานะเฉพาะตอน AutoPlay เปิดอยู่
+    MatchRecoveryInterval = 8,   -- fallback scan แบบหนัก ไม่ทำถี่
+    OverlayUpdateInterval = 1/30,-- จำกัดเฉพาะงานเส้น custom ประมาณ 30 FPS
     NewMatchDelay = 2.5,           -- หน่วงเวลารอโหลด UI และจัดโต๊ะให้เสร็จเมื่อเริ่มแมตช์ใหม่ (วินาที)
 }
 
@@ -36,6 +39,10 @@ local screenGui = nil
 local badge = nil
 local iconBtn = nil
 local lastMatchRef = nil
+local autoLoopToken = 0
+local shotInProgress = false
+local aimCalculationBusy = false
+local lastMatchScanTimestamp = 0
 
 local function safeConnect(signal, callback)
     local conn = signal:Connect(callback)
@@ -195,10 +202,20 @@ end
 
 -- // LIVE MATCH CLIENT TRACKER //
 local activeMatchClient = nil
+local oldMatchClientNew = PoolMatchClient.new
+
+-- เก็บ original ไว้เพื่อไม่ให้ hook ซ้อนเมื่อรันสคริปต์ซ้ำ
+if type(getgenv) == "function" then
+    local genv = getgenv()
+    if genv.PoolGodOriginalMatchClientNew then
+        oldMatchClientNew = genv.PoolGodOriginalMatchClientNew
+    else
+        genv.PoolGodOriginalMatchClientNew = oldMatchClientNew
+    end
+end
 
 if not PoolMatchClient._godHooked then
     PoolMatchClient._godHooked = true
-    local oldMatchClientNew = PoolMatchClient.new
     PoolMatchClient.new = function(...)
         local match = oldMatchClientNew(...)
         activeMatchClient = match
@@ -209,8 +226,9 @@ if not PoolMatchClient._godHooked then
     end
 end
 
-local lastScanTimestamp = 0
-local function getActiveMatch()
+-- ตรวจ cache ก่อนเสมอ; getgc เป็น fallback เท่านั้นและไม่ถูกเรียกถี่
+local function getActiveMatch(forceRecovery)
+    local match = activeMatchClient
     local poolGameUI = playerGui:FindFirstChild("PoolGameUI")
     if poolGameUI and poolGameUI:GetAttribute("MatchActive") == false then
         activeMatchClient = nil
@@ -218,71 +236,70 @@ local function getActiveMatch()
     end
 
     local liveRep = PoolMatchReplica.Get()
-    if activeMatchClient then
-        if liveRep and activeMatchClient.Replica and activeMatchClient.Replica ~= liveRep then
-            activeMatchClient = nil -- Match เก่าหมดอายุ ให้เคลียร์ทิ้งทันที
-        elseif activeMatchClient.Input and activeMatchClient.Simulation and activeMatchClient.Rules then
-            if activeMatchClient.Rules.Phase ~= "GameOver" then
-                return activeMatchClient
-            end
+    if match then
+        if liveRep and match.Replica and match.Replica ~= liveRep then
             activeMatchClient = nil
+            match = nil
+        elseif match.Input and match.Simulation and match.Rules and match.Rules.Phase ~= "GameOver" then
+            return match
+        else
+            activeMatchClient = nil
+            match = nil
         end
     end
 
-    -- Throttled scan: ค้นหาไม่เกิน 1 ครั้งต่อ 3 วินาที เพื่อป้องกันทำงานซ้ำซ้อน
     local now = os.clock()
-    if now - lastScanTimestamp < 3 then
-        return activeMatchClient
+    if not forceRecovery and now - lastMatchScanTimestamp < SETTINGS.MatchRecoveryInterval then
+        return nil
     end
-    lastScanTimestamp = now
+    lastMatchScanTimestamp = now
 
-    -- ค้นหา Match กรณีรันสคริปต์กลางคันขณะที่แมตช์เริ่มไปแล้ว (ปลอดภัย 100% ไม่ยุ่งกับ RenderStepped connections)
+    -- fallback สำหรับกรณีรันสคริปต์กลางแมตช์เท่านั้น
     pcall(function()
-        if type(getgc) == "function" then
-            local inputObj, rulesObj, simObj, clientMatch
-            for _, fn in ipairs(getgc()) do
-                if type(fn) == "function" and islclosure(fn) then
-                    local info = debug.getinfo(fn)
-                    if info.source and (info.source:find("PoolGameUIHandler") or info.source:find("PoolMatchClient")) then
-                        local okUv, uvs = pcall(debug.getupvalues, fn)
-                        if okUv and uvs then
-                            for _, v in pairs(uvs) do
-                                if typeof(v) == "table" then
-                                    if rawget(v, "Simulation") and rawget(v, "Rules") and rawget(v, "Input") then
-                                        clientMatch = v
-                                        break
-                                    end
-                                    if rawget(v, "AimLocked") ~= nil and rawget(v, "Simulation") ~= nil then
-                                        inputObj = v
-                                    end
-                                    if rawget(v, "Phase") ~= nil and rawget(v, "Turn") ~= nil and rawget(v, "Groups") ~= nil then
-                                        rulesObj = v
-                                    end
-                                    if rawget(v, "Balls") and rawget(v, "Settled") ~= nil then
-                                        simObj = v
-                                    end
+        if type(getgc) ~= "function" or type(debug) ~= "table" then return end
+        local inputObj, rulesObj, simObj, clientMatch
+        for _, fn in ipairs(getgc()) do
+            if type(fn) == "function" and islclosure(fn) then
+                local okInfo, info = pcall(debug.getinfo, fn)
+                if okInfo and info and info.source and (info.source:find("PoolGameUIHandler") or info.source:find("PoolMatchClient")) then
+                    local okUv, uvs = pcall(debug.getupvalues, fn)
+                    if okUv and uvs then
+                        for _, v in pairs(uvs) do
+                            if typeof(v) == "table" then
+                                if rawget(v, "Simulation") and rawget(v, "Rules") and rawget(v, "Input") then
+                                    clientMatch = v
+                                    break
+                                end
+                                if rawget(v, "AimLocked") ~= nil and rawget(v, "Simulation") ~= nil then
+                                    inputObj = v
+                                end
+                                if rawget(v, "Phase") ~= nil and rawget(v, "Turn") ~= nil and rawget(v, "Groups") ~= nil then
+                                    rulesObj = v
+                                end
+                                if rawget(v, "Balls") and rawget(v, "Settled") ~= nil then
+                                    simObj = v
                                 end
                             end
                         end
                     end
                 end
-                if clientMatch or (inputObj and rulesObj) then break end
             end
+            if clientMatch or (inputObj and rulesObj) then break end
+        end
 
-            if clientMatch and (not liveRep or clientMatch.Replica == liveRep) then
-                activeMatchClient = clientMatch
-            elseif inputObj and rulesObj and rulesObj.Phase ~= "GameOver" then
-                activeMatchClient = {
-                    Input = inputObj,
-                    Simulation = inputObj.Simulation or simObj,
-                    Rules = rulesObj,
-                    Overlay = inputObj.Overlay,
-                    View = inputObj.View,
-                    Hud = inputObj.Hud,
-                    Seat = 1,
-                    IsBotMatch = true,
-                }
-            end
+        if clientMatch and (not liveRep or clientMatch.Replica == liveRep) then
+            activeMatchClient = clientMatch
+        elseif inputObj and rulesObj and rulesObj.Phase ~= "GameOver" then
+            activeMatchClient = {
+                Input = inputObj,
+                Simulation = inputObj.Simulation or simObj,
+                Rules = rulesObj,
+                Overlay = inputObj.Overlay,
+                View = inputObj.View,
+                Hud = inputObj.Hud,
+                Seat = 1,
+                IsBotMatch = true,
+            }
         end
     end)
 
@@ -381,7 +398,7 @@ end
 
 -- ตรวจสอบว่าโต๊ะอยู่ในสถานะลูกเปิดโต๊ะ (Break Shot) หรือไม่
 local function isBreakShot(match)
-    match = match or getActiveMatch()
+    match = match or activeMatchClient
     if not match then return false end
 
     -- 1. ตรวจสอบทางกายภาพของลูกบนโต๊ะ (แม่นยำที่สุด 100% ป้องกันกรณีฝ่ายตรงข้ามยิงเปิดแล้วระบบยังคิดว่าไม่ได้เปิด)
@@ -473,24 +490,37 @@ local function isBallLegalForMe(match, ballNumber)
 end
 
 -- // LINE DRAWING HELPERS //
+local lineCache = setmetatable({}, { __mode = "k" })
+local hiddenRootCache = setmetatable({}, { __mode = "k" })
+local overlayUpdateCache = setmetatable({}, { __mode = "k" })
+
 local function getOrCreateLine(root, name, color, zIndex)
-    local line = root:FindFirstChild(name)
-    if not line then
-        line = Instance.new("ImageLabel")
-        line.Name = name
-        line.AnchorPoint = Vector2.new(0.5, 0.5)
-        line.BorderSizePixel = 0
-        line.BackgroundColor3 = color
-        line.ImageColor3 = color
-        line.BackgroundTransparency = 0
-        line.ImageTransparency = 1
-        line.ZIndex = zIndex or 50
-        line.Visible = false
-        line.Parent = root
-    else
-        line.BackgroundColor3 = color
-        line.ImageColor3 = color
+    if not root then return nil end
+    local cache = lineCache[root]
+    if not cache then
+        cache = {}
+        lineCache[root] = cache
     end
+
+    local line = cache[name]
+    if not line or not line.Parent then
+        line = root:FindFirstChild(name)
+        if not line then
+            line = Instance.new("ImageLabel")
+            line.Name = name
+            line.AnchorPoint = Vector2.new(0.5, 0.5)
+            line.BorderSizePixel = 0
+            line.BackgroundTransparency = 0
+            line.ImageTransparency = 1
+            line.ZIndex = zIndex or 50
+            line.Visible = false
+            line.Parent = root
+        end
+        cache[name] = line
+    end
+
+    line.BackgroundColor3 = color
+    line.ImageColor3 = color
     return line
 end
 
@@ -521,8 +551,14 @@ local function hideAllOverlayLines(overlay)
         if overlay.Ghost then overlay.Ghost.Visible = false end
         if overlay.GhostBall then overlay.GhostBall.Visible = false end
     end
-    local root = (overlay and overlay.Root) or playerGui:FindFirstChild("AimOverlay", true)
-    if root then
+
+    local root = (overlay and overlay.Root)
+    if not root then
+        root = playerGui:FindFirstChild("AimOverlay", true)
+    end
+    if root and not hiddenRootCache[root] then
+        -- ล้างของเก่าครั้งเดียวต่อ root; ไม่ GetChildren ทุก loop
+        hiddenRootCache[root] = true
         for _, ch in ipairs(root:GetChildren()) do
             if ch:IsA("GuiObject") and ch.Name ~= "CueStick" then
                 ch.Visible = false
@@ -532,6 +568,15 @@ local function hideAllOverlayLines(overlay)
 end
 
 local oldOverlayUpdate = PoolAimOverlay.Update
+if type(getgenv) == "function" then
+    local genv = getgenv()
+    if genv.PoolGodOriginalOverlayUpdate then
+        oldOverlayUpdate = genv.PoolGodOriginalOverlayUpdate
+    else
+        genv.PoolGodOriginalOverlayUpdate = oldOverlayUpdate
+    end
+end
+
 PoolAimOverlay.Update = function(self, p2, p3, p4, p5, p6, p7)
     local root = self.Root
 
@@ -570,11 +615,21 @@ PoolAimOverlay.Update = function(self, p2, p3, p4, p5, p6, p7)
     local res = oldOverlayUpdate(self, p2, p3, p4, p5, p6, p7)
     if not root then return res end
 
-    -- ล้างเส้นรุ่นเก่าถ้ามีตกค้าง
-    local oldV2Lines = { "BankObjLine1", "BankObjLine2", "BankCueLine1", "BankCueLine2", "BankDeflectLine", "BankRailDot1", "BankRailDot2", "BankPocketDot" }
-    for _, name in ipairs(oldV2Lines) do
-        local el = root:FindFirstChild(name)
-        if el then el:Destroy() end
+    -- งานเส้น custom เป็นงานเสริม: จำกัดไว้ประมาณ 30 FPS และข้ามเฟรมที่ถี่เกินไป
+    local now = os.clock()
+    local last = overlayUpdateCache[self] or 0
+    if now - last < SETTINGS.OverlayUpdateInterval then
+        return res
+    end
+    overlayUpdateCache[self] = now
+
+    -- ลบเส้นรุ่นเก่าครั้งแรกเท่านั้น ไม่ทำลาย/สร้างซ้ำทุก Update
+    if not hiddenRootCache[root] then
+        local oldV2Lines = { "BankObjLine1", "BankObjLine2", "BankCueLine1", "BankCueLine2", "BankDeflectLine", "BankRailDot1", "BankRailDot2", "BankPocketDot" }
+        for _, name in ipairs(oldV2Lines) do
+            local el = root:FindFirstChild(name)
+            if el then el:Destroy() end
+        end
     end
 
     local thick = SETTINGS.LineThickness
@@ -925,7 +980,7 @@ local function calculateBestShot(match)
 end
 
 local function resetAimState(match)
-    match = match or getActiveMatch()
+    match = match or activeMatchClient
     if not match or not match.Input then return end
     pcall(function()
         if PoolInputController.ReleaseAim then
@@ -967,8 +1022,15 @@ local function executeSnapAim(silent)
         return false
     end
 
-    local choice = calculateBestShot(match)
-    if not choice or not choice.Direction then
+    if aimCalculationBusy then
+        return false
+    end
+
+    aimCalculationBusy = true
+    local okCalc, choice = pcall(calculateBestShot, match)
+    aimCalculationBusy = false
+
+    if not okCalc or not choice or not choice.Direction then
         if not silent then notify("8 Ball Duels", "⚠️ ไม่พบมุมยิงที่ชัดเจน") end
         return false
     end
@@ -987,20 +1049,28 @@ end
 
 -- // 3. AUTO SHOOT (กดยิงทันที คำนวณความแรงอัตโนมัติ) //
 local function executeShoot(silent)
+    if shotInProgress then return false end
+    shotInProgress = true
+
     -- ถ้าเปิดบอทเล่นอัตโนมัติ [A] อยู่ และเป็นการกดจากผู้เล่น (not silent): แจ้งเตือนว่าบอทควบคุมอยู่
     if autoPlayEnabled and not silent then
         notify("8 Ball Duels 🎱", "⚠️ กำลังใช้งานบอท [A] อยู่ (บอทยิงให้อัตโนมัติ)")
+        shotInProgress = false
         return false
     end
 
     local match = getActiveMatch()
-    if not match or not match.Input then return false end
+    if not match or not match.Input then
+        shotInProgress = false
+        return false
+    end
 
     -- หากเป็นลูกเปิดโต๊ะ (Break Shot) บังคับให้ผู้เล่นเป็นคนเล็งและยิงเปิดโต๊ะเอง
     if isBreakShot(match) then
         if not silent then
             notify("8 Ball Duels 🎱", "⚠️ ผู้ใช้ต้องยิงเปิดโต๊ะ")
         end
+        shotInProgress = false
         return false
     end
 
@@ -1029,23 +1099,28 @@ local function executeShoot(silent)
         if not silent then
             notify("🎱 Potted!", "ยิงเรียบร้อยแล้ว!")
         end
+        shotInProgress = false
         return true
     end
+    shotInProgress = false
     return false
 end
 
 -- // 4. AUTO PLAY TOGGLE (บอท God Mode เล่นให้อัตโนมัติ ปิดเส้นเพื่อประสิทธิภาพสูงสุด) //
 local updateHudBadge = function() end
+local startAutoPlayLoop
 
 local function toggleAutoPlay()
     autoPlayEnabled = not autoPlayEnabled
     notify("บอทเล่นอัตโนมัติ 🤖", autoPlayEnabled and "🟢 เปิดใช้งาน (ระดับ God Mode - ปิดเส้นลดโหลด)" or "🔴 ปิดการทำงาน (คืนการควบคุมไม้ & เปิดเส้น)")
     updateHudBadge()
-    local match = getActiveMatch()
+    local match = getActiveMatch(false)
     if autoPlayEnabled then
         hideAllOverlayLines(match and match.Overlay)
+        startAutoPlayLoop()
     else
-        resetAimState()
+        autoLoopToken = autoLoopToken + 1
+        resetAimState(match)
         if match and match.Overlay then
             match.Overlay.GuidesEnabled = true
         end
@@ -1059,7 +1134,7 @@ disableAutoPlayOnMatchEnd = function()
         pcall(function()
             updateHudBadge()
             resetAimState()
-            local match = getActiveMatch()
+            local match = activeMatchClient
             if match and match.Overlay then
                 match.Overlay.GuidesEnabled = true
             end
@@ -1079,7 +1154,7 @@ killScript = function(reason)
 
     -- 2. ปลดการล็อก Aim/Shoot คืนการควบคุมให้ผู้เล่นและเกม 100%
     pcall(function()
-        local match = getActiveMatch()
+        local match = activeMatchClient
         if match and match.Input then
             match.Input.AimLocked = false
             match.Input.ChargeLocked = false
@@ -1096,6 +1171,24 @@ killScript = function(reason)
         pcall(function() conn:Disconnect() end)
     end
     table.clear(scriptConnections)
+    autoLoopToken = autoLoopToken + 1
+    shotInProgress = false
+    aimCalculationBusy = false
+
+    -- คืน hook เดิม เพื่อไม่ให้การรันครั้งถัดไปเกิด hook ซ้อน
+    pcall(function()
+        if PoolMatchClient and oldMatchClientNew then
+            PoolMatchClient.new = oldMatchClientNew
+            PoolMatchClient._godHooked = false
+        end
+        if PoolAimOverlay and oldOverlayUpdate then
+            PoolAimOverlay.Update = oldOverlayUpdate
+        end
+        if type(getgenv) == "function" then
+            getgenv().PoolGodOriginalMatchClientNew = nil
+            getgenv().PoolGodOriginalOverlayUpdate = nil
+        end
+    end)
 
     -- 4. ทำลายหน้าต่าง GUI (PoolLiteHUD) และไอคอนทั้งหมด
     pcall(function()
@@ -1217,128 +1310,125 @@ end
 
 local breakNoticeSent = false
 
-_G.PoolGodModeInstance = (_G.PoolGodModeInstance or 0) + 1
-local currentInstance = _G.PoolGodModeInstance
+-- AutoPlay เป็น loop แบบ on-demand: ไม่มี loop ทำงานเมื่อผู้ใช้ปิด A
+startAutoPlayLoop = function()
+    autoLoopToken = autoLoopToken + 1
+    local token = autoLoopToken
 
-task.spawn(function()
-    while _G.PoolGodModeInstance == currentInstance do
-        task.wait(0.25)
-        local match = getActiveMatch()
+    task.spawn(function()
+        while autoPlayEnabled and not scriptKilled and token == autoLoopToken do
+            task.wait(SETTINGS.AutoLoopInterval)
 
-        -- บันทึกว่าแมตช์ได้เริ่มเล่นแล้วจริง (ป้องกันการ Kill ตอนอยู่ในล็อบบี้หรือรอห้อง)
-        if match and match.Input and match.Rules then
+            if not autoPlayEnabled or scriptKilled or token ~= autoLoopToken then
+                break
+            end
+
+            local match = getActiveMatch(false)
+            if not match or not match.Input or not match.Rules or not match.Simulation then
+                continue
+            end
+
+            local phase = match.Rules.Phase
+            if phase == "GameOver" or match.Input.State == "GameOver" then
+                disableAutoPlayOnMatchEnd()
+                break
+            end
+
+            if not lastMatchRef then
+                lastMatchRef = match.Replica or match.Rules or match.Simulation or match
+                matchReadyTimestamp = os.clock()
+            end
+
+            -- Break shot: ไม่แตะ AI และคืน control ให้ผู้เล่น
+            if isBreakShot(match) then
+                breakNoticeSent = false
+                pcall(function()
+                    match.Input.AimLocked = false
+                    match.Input.ChargeLocked = false
+                    match.Input.Muted = false
+                end)
+                if isMyTurn(match) and not breakNoticeSent then
+                    breakNoticeSent = true
+                    notify("บอทเล่นอัตโนมัติ 🤖", "⚠️ ผู้ใช้ต้องยิงเปิดโต๊ะเอง (บอท A จะเริ่มเล่นอัตโนมัติหลังเปิดโต๊ะ)")
+                end
+                continue
+            end
+
+            breakNoticeSent = false
+
+            -- ตรวจจบแมตช์จาก state ปัจจุบันโดยไม่ scan getgc
             local rep = match.Replica or PoolMatchReplica.Get()
             local pm = rep and rep.Data and rep.Data.poolMatch
-            local phase = (pm and pm.Phase) or match.Rules.Phase
-            if phase == "Playing" or phase == "Open" or phase == "Assigned" then
-                if not lastMatchRef then
-                    lastMatchRef = match.Replica or match.Rules or match.Simulation or match
-                end
+            if (pm and (pm.RulesPhase == "GameOver" or pm.Phase == "Finished")) then
+                disableAutoPlayOnMatchEnd()
+                break
             end
-        end
 
-        -- ตรวจสอบการสิ้นสุดแมตช์ (GameOver / Match Finished / หลุดออกจากห้อง)
-        local isOver = false
-        if lastMatchRef ~= nil then
-            if match then
-                local rep = match.Replica or PoolMatchReplica.Get()
-                local pm = rep and rep.Data and rep.Data.poolMatch
-                if (pm and (pm.RulesPhase == "GameOver" or pm.Phase == "Finished"))
-                   or (match.Rules and match.Rules.Phase == "GameOver")
-                   or (match.Input and match.Input.State == "GameOver") then
-                    isOver = true
-                end
-            else
-                isOver = true
+            if not isMatchFullyReady(match) or not isMyTurn(match) then
+                continue
             end
-        end
+            if not match.Simulation.Settled or match.Input.State == "Simulating" then
+                continue
+            end
 
-        if isOver then
-            lastMatchRef = nil
-            disableAutoPlayOnMatchEnd()
-            killScript("🏁 แมตช์จบแล้ว - สคริปต์ทำลายตัวเองเรียบร้อย 100% (Clean Kill)")
-            break
-        end
+            -- God Mode lock เฉพาะตอนที่พร้อมทำงานจริง
+            pcall(function()
+                match.Input.AimLocked = true
+                match.Input.ChargeLocked = true
+                match.Input.Muted = true
+            end)
 
-        if autoPlayEnabled then
-            if match and match.Input and match.Rules and match.Simulation then
-                -- ถ้าเป็นลูกเปิดโต๊ะ (Break Shot): บังคับให้ผู้เล่นยิงเปิดโต๊ะเอง ไม่ยิงอัตโนมัติ
-                if isBreakShot(match) then
-                    -- คืนการควบคุมให้ผู้เล่น 100% เพื่อเล็งและยิงเปิดโต๊ะเอง
-                    pcall(function()
-                        match.Input.AimLocked = false
-                        match.Input.ChargeLocked = false
-                        match.Input.Muted = false
-                    end)
-                    if isMyTurn(match) and not breakNoticeSent then
-                        breakNoticeSent = true
-                        notify("บอทเล่นอัตโนมัติ 🤖", "⚠️ ผู้ใช้ต้องยิงเปิดโต๊ะเอง (บอท A จะเริ่มเล่นอัตโนมัติหลังเปิดโต๊ะ)")
-                    end
-                else
-                    breakNoticeSent = false
-                    hideAllOverlayLines()
-
-                    -- เข้าสู่โหมด God Mode หลังเปิดโต๊ะ: ปิดการควบคุมของผู้เล่น 100% เพื่อให้บอทควบคุมทั้งหมด
-                    pcall(function()
-                        match.Input.AimLocked = true
-                        match.Input.ChargeLocked = true
-                        match.Input.Muted = true
-                    end)
-
-                    -- ตรวจสอบว่าแมตช์ โต๊ะ และ UI โหลดเสร็จสมบูรณ์ และเป็นเทิร์นของเราจริงที่ลูกหยุดนิ่งสนิทแล้ว
-                    if isMatchFullyReady(match) and isMyTurn(match) and match.Simulation.Settled and match.Input.State ~= "Simulating" then
-                        -- จัดการวางลูกขาวอัตโนมัติ (Ball-in-Hand / Free Ball Placement) สำหรับลูกปกติ
-                        if match.Input.State == "BallInHand" or (match.Input.CanPlaceCueBall and match.Input.BallHeld) then
-                            local mySeat = getMySeat(match)
-                            local myGroup = getMyGroup(match, mySeat)
-                            local planRules = {
-                                Phase = match.Rules.Phase,
-                                Turn = mySeat,
-                                Groups = match.Rules.Groups or {},
-                                Rules = match.Rules.Rules,
-                            }
-                            if myGroup and not planRules.Groups[mySeat] then
-                                planRules.Groups[mySeat] = myGroup
-                            end
-                            local aiInstance = { Level = GOD_LEVEL, Random = Random.new(0) }
-                            setmetatable(aiInstance, PoolAI)
-                            local okSpot, bestSpot = pcall(function()
-                                return PoolAI.PlaceCueBall(aiInstance, match.Simulation, planRules)
+            -- Ball-in-Hand: คำนวณและวางเพียงครั้งเดียวต่อ state
+            if match.Input.State == "BallInHand" or (match.Input.CanPlaceCueBall and match.Input.BallHeld) then
+                local mySeat = getMySeat(match)
+                local myGroup = getMyGroup(match, mySeat)
+                local planRules = {
+                    Phase = match.Rules.Phase,
+                    Turn = mySeat,
+                    Groups = match.Rules.Groups or {},
+                    Rules = match.Rules.Rules,
+                }
+                if myGroup and not planRules.Groups[mySeat] then
+                    planRules.Groups[mySeat] = myGroup
+                end
+                local aiInstance = { Level = GOD_LEVEL, Random = Random.new(0) }
+                setmetatable(aiInstance, PoolAI)
+                local okSpot, bestSpot = pcall(function()
+                    return PoolAI.PlaceCueBall(aiInstance, match.Simulation, planRules)
+                end)
+                if okSpot and bestSpot and typeof(bestSpot) == "Vector2" then
+                    local cueBall = match.Simulation.Balls[PoolConstants.CueBallNumber]
+                    if cueBall then
+                        cueBall.Position = bestSpot
+                        if match.View then
+                            pcall(function()
+                                PoolViewController.SetBall(match.View, PoolConstants.CueBallNumber, bestSpot)
                             end)
-                            if okSpot and bestSpot and typeof(bestSpot) == "Vector2" then
-                                local cueBall = match.Simulation.Balls[PoolConstants.CueBallNumber]
-                                if cueBall then
-                                    cueBall.Position = bestSpot
-                                    if match.View then
-                                        pcall(function()
-                                            PoolViewController.SetBall(match.View, PoolConstants.CueBallNumber, bestSpot)
-                                        end)
-                                    end
-                                    match.Input.Dragging = false
-                                    match.Input.BallHeld = false
-                                    pcall(function()
-                                        PoolInputController.SetState(match.Input, "Aiming")
-                                    end)
-                                    task.wait(0.3)
-                                end
-                            end
                         end
-
-                        task.wait(SETTINGS.AutoPlayDelay)
-                        -- ตรวจสอบซ้ำอีกครั้งหลังดีเลย์ เพื่อป้องกันยิงตอนเปลี่ยนเทิร์นหรือหมดเวลา
-                        if autoPlayEnabled and isMatchFullyReady(match) and isMyTurn(match) and match.Simulation.Settled and match.Input.State ~= "Simulating" then
-                            executeShoot(true)
-                            task.wait(1.5)
-                        end
+                        match.Input.Dragging = false
+                        match.Input.BallHeld = false
+                        pcall(function()
+                            PoolInputController.SetState(match.Input, "Aiming")
+                        end)
                     end
                 end
+                task.wait(0.3)
+                continue
+            end
+
+            task.wait(SETTINGS.AutoPlayDelay)
+
+            -- ตรวจ state อีกครั้งก่อนยิง; executeShoot มี lock กันซ้ำอีกชั้น
+            if autoPlayEnabled and not scriptKilled and isMatchFullyReady(match) and isMyTurn(match)
+                and match.Simulation.Settled and match.Input.State ~= "Simulating" then
+                executeShoot(true)
+                task.wait(1.5)
             end
         end
-    end
-end)
+    end)
+end
 
-
-
+-- เริ่ม AutoPlay เฉพาะตอนกด A เท่านั้น
 -- // KEYBIND & INPUT LISTENER //
 safeConnect(UserInputService.InputBegan, function(input, gpe)
     if gpe then return end
