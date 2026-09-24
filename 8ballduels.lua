@@ -58,7 +58,7 @@ end
 -- ป้องกันการค้าง Yield ตลอดกาลหากรันผิด PlaceId หรือเกมยังโหลดไม่เสร็จ
 local Libraries = ReplicatedStorage:WaitForChild("Libraries", 10)
 if not Libraries then
-    notify("8 Ball Duels ❌", "ยังไม่พบโมดูลเกม (หากอยู่ในล็อบบี้หลัก ให้กดจอยเข้าโต๊ะเล่นก่อน)")
+    notify("8 Ball Duels ❌", "ไม่พบโฟลเดอร์เกม (PlaceId ปัจจุบัน: " .. tostring(game.PlaceId) .. " ไม่ใช่ 8 Ball Duels)")
     warn("❌ [Pool God Mode] Cannot load: ReplicatedStorage.Libraries not found. PlaceId: " .. tostring(game.PlaceId))
     return
 end
@@ -66,7 +66,7 @@ end
 local GameSpecific = Libraries:WaitForChild("GameSpecific", 5)
 local PoolFolder = GameSpecific and GameSpecific:WaitForChild("Pool", 5)
 if not PoolFolder then
-    notify("8 Ball Duels ❌", "ยังไม่พบโฟลเดอร์ Pool (หากอยู่ในล็อบบี้หลัก ให้กดจอยเข้าโต๊ะเล่นก่อน)")
+    notify("8 Ball Duels ❌", "ไม่พบโฟลเดอร์ Pool ใน PlaceId: " .. tostring(game.PlaceId))
     warn("❌ [Pool God Mode] Cannot load: PoolFolder not found. PlaceId: " .. tostring(game.PlaceId))
     return
 end
@@ -194,9 +194,9 @@ local function checkPocketHit(p1, p2)
 end
 
 -- // LIVE MATCH CLIENT TRACKER //
-local activeMatchClient = (type(getgenv) == "function" and getgenv().ActivePoolMatch) or nil
+local activeMatchClient = nil
 
-if not rawget(PoolMatchClient, "_godHooked") then
+if not PoolMatchClient._godHooked then
     PoolMatchClient._godHooked = true
     local oldMatchClientNew = PoolMatchClient.new
     PoolMatchClient.new = function(...)
@@ -214,55 +214,33 @@ local function getActiveMatch()
     local poolGameUI = playerGui:FindFirstChild("PoolGameUI")
     if poolGameUI and poolGameUI:GetAttribute("MatchActive") == false then
         activeMatchClient = nil
-        if type(getgenv) == "function" then
-            getgenv().ActivePoolMatch = nil
-        end
         return nil
-    end
-
-    if not activeMatchClient and type(getgenv) == "function" and getgenv().ActivePoolMatch then
-        activeMatchClient = getgenv().ActivePoolMatch
     end
 
     local liveRep = PoolMatchReplica.Get()
     if activeMatchClient then
         if liveRep and activeMatchClient.Replica and activeMatchClient.Replica ~= liveRep then
             activeMatchClient = nil -- Match เก่าหมดอายุ ให้เคลียร์ทิ้งทันที
-            if type(getgenv) == "function" then
-                getgenv().ActivePoolMatch = nil
-            end
         elseif activeMatchClient.Input and activeMatchClient.Simulation and activeMatchClient.Rules then
             if activeMatchClient.Rules.Phase ~= "GameOver" then
                 return activeMatchClient
             end
             activeMatchClient = nil
-            if type(getgenv) == "function" then
-                getgenv().ActivePoolMatch = nil
-            end
         end
     end
 
-    -- หากไม่มี Match ที่กำลังเล่นอยู่ หรืออยู่ในหน้า Lobby ให้ข้ามการค้นหา ไม่ต้องสแกน
-    if not poolGameUI or poolGameUI:GetAttribute("MatchActive") ~= true then
-        return nil
-    end
-
-    -- Throttled scan (แนวทาง B): ค้นหาไม่เกิน 1 ครั้งต่อ 5 วินาที และจำกัดการสแกน ป้องกัน Luau VM ค้าง 100%
+    -- Throttled scan: ค้นหาไม่เกิน 1 ครั้งต่อ 3 วินาที เพื่อป้องกันทำงานซ้ำซ้อน
     local now = os.clock()
-    if now - lastScanTimestamp < 5 then
+    if now - lastScanTimestamp < 3 then
         return activeMatchClient
     end
     lastScanTimestamp = now
 
-    -- ค้นหา Match สำรองกรณีรันสคริปต์กลางคัน (Safe Bounded Throttled Scan)
+    -- ค้นหา Match กรณีรันสคริปต์กลางคันขณะที่แมตช์เริ่มไปแล้ว (ปลอดภัย 100% ไม่ยุ่งกับ RenderStepped connections)
     pcall(function()
         if type(getgc) == "function" then
             local inputObj, rulesObj, simObj, clientMatch
-            local count = 0
             for _, fn in ipairs(getgc()) do
-                count = count + 1
-                if count > 200 then break end -- ป้องกัน Unbounded Walk ล็อกจำนวนสูงสุดไม่เกิน 200 รายการ
-
                 if type(fn) == "function" and islclosure(fn) then
                     local info = debug.getinfo(fn)
                     if info.source and (info.source:find("PoolGameUIHandler") or info.source:find("PoolMatchClient")) then
@@ -293,9 +271,6 @@ local function getActiveMatch()
 
             if clientMatch and (not liveRep or clientMatch.Replica == liveRep) then
                 activeMatchClient = clientMatch
-                if type(getgenv) == "function" then
-                    getgenv().ActivePoolMatch = clientMatch
-                end
             elseif inputObj and rulesObj and rulesObj.Phase ~= "GameOver" then
                 activeMatchClient = {
                     Input = inputObj,
@@ -307,9 +282,6 @@ local function getActiveMatch()
                     Seat = 1,
                     IsBotMatch = true,
                 }
-                if type(getgenv) == "function" then
-                    getgenv().ActivePoolMatch = activeMatchClient
-                end
             end
         end
     end)
@@ -1284,9 +1256,6 @@ task.spawn(function()
         if isOver then
             lastMatchRef = nil
             activeMatchClient = nil
-            if type(getgenv) == "function" then
-                getgenv().ActivePoolMatch = nil
-            end
             disableAutoPlayOnMatchEnd()
             pcall(function()
                 if match and match.Input then
@@ -1301,9 +1270,7 @@ task.spawn(function()
             end)
             notify("8 Ball Duels 🎱", "🏁 แมตช์จบแล้ว - สคริปต์เข้าสู่โหมด Standby รอแมตช์ถัดไป...")
             task.wait(2)
-        end
-
-        if autoPlayEnabled then
+        elseif autoPlayEnabled then
             if match and match.Input and match.Rules and match.Simulation then
                 -- ถ้าเป็นลูกเปิดโต๊ะ (Break Shot): บังคับให้ผู้เล่นยิงเปิดโต๊ะเอง ไม่ยิงอัตโนมัติ
                 if isBreakShot(match) then
@@ -1502,7 +1469,7 @@ titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 titleLabel.Parent = badge
 
 local subHint = Instance.new("TextLabel")
-subHint.Text = "คลิกลากย้ายได้ • [X] ปิดสคริปต์ • [—] ย่อลูกบอล"
+subHint.Text = "คลิกลากย้ายได้ • [X] ปิด/Kill • [—] ย่อลูกบอล"
 subHint.TextColor3 = Color3.fromRGB(135, 148, 172)
 subHint.TextSize = 13
 subHint.Font = Enum.Font.Gotham
